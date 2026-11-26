@@ -407,16 +407,36 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   width: 560px; max-width: 100%; max-height: 86vh; display: flex; flex-direction: column;
   box-shadow: 0 24px 64px -24px rgba(0,0,0,.6);
 }
-.dlg header { padding: 17px 20px 13px; border-bottom: 1px solid var(--line-soft); }
+/* 添加账号弹窗 tab 多（8 个），单独放宽到 720px；窄屏仍受 max-width:100% 约束。 */
+#addVeil .dlg { width: 720px; }
+.dlg header { padding: 17px 20px 13px; border-bottom: 1px solid var(--line-soft); flex: none; }
 .dlg header h3 { font-size: 15px; font-weight: 620; }
 .dlg header .hint { color: var(--ink-3); font-size: 12.5px; margin-top: 5px; }
-.dlg .body { padding: 18px 20px; overflow: auto; }
-.dlg footer { padding: 13px 20px; border-top: 1px solid var(--line-soft); display: flex; gap: 10px; }
+.dlg .body { padding: 18px 20px; overflow: auto; flex: 1; min-height: 0; }
+.dlg footer { padding: 13px 20px; border-top: 1px solid var(--line-soft); display: flex; gap: 10px; flex: none; }
 .dlg footer .grow { flex: 1; }
-.dlg .tabs { display: inline-flex; gap: 2px; background: var(--surface-2); border-radius: 9px; padding: 3px; margin-left: 10px; vertical-align: middle; }
-.dlg .tabs .tab { padding: 4px 14px; border-radius: 7px; border: none; background: transparent; color: var(--ink-3); font: 550 12.5px var(--sans); cursor: pointer; }
+/* tabs 横向排布：8 个 tab 在 560px 里会被 flex 压缩成竖排文字，这里禁止收缩+禁止换行，
+   窄屏改为横向滚动而不是把文字挤成「豆/包」两行。 */
+.dlg .tabs {
+  display: flex; flex-wrap: nowrap; align-items: center; gap: 2px;
+  background: var(--surface-2); border-radius: 9px; padding: 3px;
+  margin: 10px 0 0; max-width: 100%; overflow-x: auto; overflow-y: hidden;
+  scrollbar-width: thin;
+}
+.dlg .tabs .tab {
+  flex: 0 0 auto; white-space: nowrap; padding: 5px 12px; border-radius: 7px;
+  border: none; background: transparent; color: var(--ink-3);
+  font: 550 12.5px/1.3 var(--sans); cursor: pointer;
+}
 .dlg .tabs .tab.on { background: var(--surface); color: var(--ink); box-shadow: 0 1px 3px rgba(0,0,0,.25); }
 .tab-panel + .tab-panel { border-top: 1px solid var(--line-soft); margin: 0 -20px; padding: 14px 20px 0; }
+@media (max-width: 760px) {
+  #addVeil .dlg { width: 100%; }
+  .dlg header { padding: 14px 14px 10px; }
+  .dlg .body { padding: 14px; }
+  .dlg footer { padding: 11px 14px; }
+  .tab-panel + .tab-panel { margin: 0 -14px; padding: 12px 14px 0; }
+}
 .url {
   background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px;
   padding: 11px 13px; font: 12px var(--mono); overflow-wrap: anywhere; color: var(--accent);

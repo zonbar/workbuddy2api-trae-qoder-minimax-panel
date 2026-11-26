@@ -108,11 +108,27 @@ func headlessBrowserArgs(args []string) []string {
 	return append(headless, args...)
 }
 
+// browserPortsReserved 记录进程内刚分配出去的调试端口及时间。
+//
+// 为什么需要：freePort 靠 bind 检测端口空闲，但 exec.Command.Start() 只是拉起
+// 进程，Chromium 要过几百毫秒才真正监听调试端口。这段时间里端口仍是"可 bind"
+// 的，连续发起两个平台的登录（如豆包 + CodeArts）就会拿到同一个端口，两边
+// 会话串台——实测 CodeArts 的 poll 读到了豆包的页面内容。reserved 在端口
+// 分配后记一笔，TTL 内不再重复分配，等浏览器真正接管。
+var browserPortsReserved sync.Map // port -> time.Time
+
+const browserPortReserveTTL = 30 * time.Second
+
 func freePort(ports []int) (int, error) {
+	now := time.Now()
 	for _, p := range ports {
+		if last, ok := browserPortsReserved.Load(p); ok && now.Sub(last.(time.Time)) < browserPortReserveTTL {
+			continue // 刚分给别的会话，浏览器可能还没监听，跳过
+		}
 		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
 		if err == nil {
 			ln.Close()
+			browserPortsReserved.Store(p, now)
 			return p, nil
 		}
 	}

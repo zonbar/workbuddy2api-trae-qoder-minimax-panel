@@ -5,7 +5,7 @@ let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'checkin';   // 账号池视图已移除（2026-10-24）：签到池是默认首页
 let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null, wbQrMode = false;
-let browserQrTimer = null, browserQrPlatform = '', browserQrEmail = '';
+let browserQrTimer = null, browserQrPlatform = '', browserQrEmail = '', browserQrShotBusy = false;
 let traeLoginState = null, traeTimer = null;   // Trae 授权登录（与 WorkBuddy 那套分开）
 let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
@@ -1521,13 +1521,16 @@ function browserQrStatus(text) {
   if (st) st.textContent = text || '';
 }
 async function refreshBrowserQrShot() {
-  if (!browserQrPlatform) return;
+  // 后端要逐个候选框截图校验，单次请求可能比轮询间隔长；这里串行化，
+  // 避免多个请求同时压到同一个 CDP 端口上互相干扰。
+  if (!browserQrPlatform || browserQrShotBusy) return;
+  browserQrShotBusy = true;
+  const img = $('browserQrImg');
   const qs = 'platform=' + encodeURIComponent(browserQrPlatform) +
     (browserQrEmail ? '&email=' + encodeURIComponent(browserQrEmail) : '') +
     '&t=' + Date.now();
   try {
     const r = await api('browser/qr?' + qs, { cache: 'no-store' });
-    const img = $('browserQrImg');
     const statusText = {
       new: '请用手机 App 扫描下方二维码',
       authorizing: '已扫描，请在手机上确认授权',
@@ -1537,9 +1540,14 @@ async function refreshBrowserQrShot() {
     let msg = statusText[r.qr_status] || '请用手机 App 扫描下方二维码';
     if (r.qr_error === '427') msg = '二维码已过期，请重新发起扫码登录';
     if (r.qr && img) { img.src = r.qr; img.hidden = false; browserQrStatus(msg); }
-    else browserQrStatus('等待登录页渲染二维码…');
+    else { if (img) { img.hidden = true; img.removeAttribute('src'); } browserQrStatus('等待登录页渲染二维码…'); }
   } catch (e) {
-    browserQrStatus('等待登录页渲染二维码…（' + e.message + '）');
+    // 二维码未渲染时后端返回错误：清掉上一轮可能截错的图，统一显示等待态，
+    // 不把内部错误详情（含 URL）暴露给用户，下一轮轮询会继续重试。
+    if (img) { img.hidden = true; img.removeAttribute('src'); }
+    browserQrStatus('等待登录页渲染二维码…');
+  } finally {
+    browserQrShotBusy = false;
   }
 }
 async function pollBrowserQrShot() {

@@ -7,8 +7,13 @@
 package panel
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	_ "image/png" // 注册 PNG decoder，供 image.Decode 识别二维码截图
 	"net/http"
 	"strings"
 	"sync"
@@ -16,7 +21,11 @@ import (
 )
 
 // browserQRFindJS 在页面（含同源 iframe）里找可见的二维码元素，返回裁剪框。
-// 找不到时返回 null，调用方退化为截取整个视口，避免因为选择器变化直接失败。
+// 找不到时返回 null——调用方会显示「等待渲染」并在下一轮重试，绝不能退化成
+// 截取整个视口。这里只负责给出「候选裁剪框」，候选到底是不是二维码由
+// qrShotLooksLikeQR 对截图内容做校验；不要再靠 src/class 去猜装饰图：
+// 实测 Trae 的真二维码就是一张 325KB 的 data:image/svg+xml，而豆包礼盒插画
+// 反倒是短 URL 远程图，按体积/内联与否猜只会两头误判。
 const browserQRFindJS = `(() => {
   const docs = [document];
   try {
@@ -24,12 +33,12 @@ const browserQRFindJS = `(() => {
       if (f.contentDocument) docs.push(f.contentDocument);
     }
   } catch (e) {}
+  // 命名的二维码容器优先，宽泛的 img/svg/canvas 兜底（仍需内容校验）。
   const selectors = [
-    'img[src*="qr" i]',
-    'svg[class*="qr" i]',
-    '[class*="qrcode" i]', '[id*="qrcode" i]',
+    '#J-qrcode', '[class*="qrcode" i]', '[id*="qrcode" i]',
     '[class*="qr-code" i]', '[id*="qr_code" i]',
     '[class*="scan" i]', '[id*="scan" i]',
+    'canvas[class*="barcode" i]', 'img[src*="qr" i]', 'svg[class*="qr" i]',
     'canvas', 'img', 'svg'
   ];
   for (const doc of docs) {
@@ -42,8 +51,8 @@ const browserQRFindJS = `(() => {
         seen.add(el);
         let r;
         try { r = el.getBoundingClientRect(); } catch (e) { continue; }
-        if (!r || r.width < 72 || r.height < 72 || r.width > 900 || r.height > 900) continue;
-        if (r.width / r.height < 0.75 || r.width / r.height > 1.35) continue;
+        if (!r || r.width < 100 || r.height < 100 || r.width > 600 || r.height > 600) continue;
+        if (r.width / r.height < 0.78 || r.width / r.height > 1.35) continue;
         if (r.bottom < 0 || r.right < 0 || r.top > innerHeight || r.left > innerWidth) continue;
         let st;
         try { st = doc.defaultView.getComputedStyle(el); } catch (e) { continue; }
@@ -85,6 +94,30 @@ const browserQRPrepareJS = `(() => {
     }
   }
   return JSON.stringify(false);
+})()`
+
+// browserQRDismissJS 隐藏盖在登录弹窗上层的营销弹窗 / 纯遮罩。
+//
+// 实测豆包点「登录」后会同时弹出「下载电脑版 新用户领 30 天订阅权益」营销弹窗，
+// 它是全屏 div.fixed + 半透明 backdrop-blur 遮罩，把登录弹窗的二维码完全挡住：
+// 二维码 DOM（div[data-testid=qrcode_image] > svg）明明在，CDP 按它的坐标裁剪
+// 出来的却是营销弹窗文字，内容校验自然一直不通过。
+//
+// 只做 display:none，不点击任何关闭按钮——实测点 × 会把登录弹窗一起关掉。
+// 含登录文案的容器一律跳过，避免误伤；这段 JS 每轮执行，因为营销弹窗可能
+// 延迟出现，且对没有这类弹窗的平台是零副作用的空操作。
+const browserQRDismissJS = `(() => {
+  let n = 0;
+  for (const e of document.querySelectorAll('div')) {
+    const c = (e.className || '').toString();
+    if (c.indexOf('fixed') < 0) continue;
+    const t = (e.innerText || '').trim();
+    if (/手机号登录|扫码登录|密码登录|验证码登录|账密登录/.test(t)) continue;
+    const promo = t.indexOf('订阅权益') >= 0 || t.indexOf('立即下载') >= 0;
+    const mask = c.indexOf('inset-0') >= 0 && t.length < 10;
+    if (promo || mask) { e.style.display = 'none'; n++; }
+  }
+  return n;
 })()`
 
 var browserQRPrepared sync.Map // key=port:platform → time.Time
@@ -151,18 +184,24 @@ func (p *Panel) browserQRPort(platform, email string) (int, error) {
 }
 
 // cdpQRScreenshot 在已有页面里定位二维码并截图，返回可直接放进 <img src> 的 data URI。
-// cdpFindQRBoxDOM 用 CDP 的 DOM 域穿透 iframe / shadow DOM 找二维码元素。
+
+// cdpFindQRBoxesDOM 用 CDP 的 DOM 域穿透 iframe / shadow DOM，返回一组候选裁剪框。
 // 网页 JS 只能读同源 iframe，登录页常把二维码放在第三方登录 iframe 里，
 // 所以 DOM.getDocument(pierce=true) 是这里最可靠的兜底。
-func cdpFindQRBoxDOM(ws *wsConn) *browserQRBox {
-	// 按「像二维码的程度」排序：命名里带 qr / scan 的最优，其次 canvas 与图片。
-	// 逐个 selector 查询而不是合并成一个，是为了避免 DOM 文档顺序把营销弹窗
-	// 排在真二维码前面（实测豆包首页的 710x279 弹窗就会抢中）。
+//
+// 返回「多个」而不是一个：实测同一个登录页里往往并存好几个近正方形元素——
+// 豆包有礼盒插画 + 二维码容器 + 二维码 svg，Qoder 支付宝页有 304×241 的外框、
+// 190×185 的详情框和 120×120 的 canvas.barcode。只取第一个框时，一旦它恰好
+// 是装饰图或尚未绘制的空白占位，整轮就白等了。交给调用方逐个截图校验更稳。
+func cdpFindQRBoxesDOM(ws *wsConn) []browserQRBox {
+	// 按「像二维码的程度」排序：命名里带 qr / scan / barcode 的最优，
+	// 其次通用 canvas 与图片。逐个 selector 查询而不是合并，避免 DOM 文档
+	// 顺序把营销弹窗排在真二维码前面。
 	selectors := []string{
-		`img[src*="qr" i]`, `svg[class*="qr" i]`,
-		`[class*="qrcode" i]`, `[id*="qrcode" i]`,
+		`#J-qrcode`, `[class*="qrcode" i]`, `[id*="qrcode" i]`,
 		`[class*="qr-code" i]`, `[id*="qr_code" i]`,
 		`[class*="scan" i]`, `[id*="scan" i]`,
+		`canvas[class*="barcode" i]`, `img[src*="qr" i]`, `svg[class*="qr" i]`,
 		`canvas`, `img`, `svg`,
 	}
 	raw, err := doubaoCDPCall(ws, 21, "DOM.getDocument", map[string]any{"depth": -1, "pierce": true}, 10*time.Second)
@@ -177,6 +216,9 @@ func cdpFindQRBoxDOM(ws *wsConn) *browserQRBox {
 	if json.Unmarshal(raw, &doc) != nil || doc.Root.NodeID == 0 {
 		return nil
 	}
+	const maxBoxes = 8
+	boxes := make([]browserQRBox, 0, maxBoxes)
+	seen := map[string]bool{}
 	for _, selector := range selectors {
 		raw, err = doubaoCDPCall(ws, 22, "DOM.querySelectorAll", map[string]any{
 			"nodeId": doc.Root.NodeID, "selector": selector,
@@ -191,6 +233,9 @@ func cdpFindQRBoxDOM(ws *wsConn) *browserQRBox {
 			continue
 		}
 		for _, id := range found.NodeIDs {
+			// 只按尺寸筛「候选框」，是不是真二维码交给 qrShotLooksLikeQR
+			// 对截图内容做校验。不要按 src/class 猜装饰图——Trae 的真二维码
+			// 就是 325KB 的 data:image/svg+xml，按体积猜会把它误杀。
 			raw, err := doubaoCDPCall(ws, 23, "DOM.getBoxModel", map[string]any{"nodeId": id}, 10*time.Second)
 			if err != nil {
 				continue
@@ -207,7 +252,7 @@ func cdpFindQRBoxDOM(ws *wsConn) *browserQRBox {
 			}
 			w, h := bm.Model.Width, bm.Model.Height
 			// 二维码基本是正方形；这条过滤掉了弹窗、banner 这类宽扁元素。
-			if w < 72 || h < 72 || w > 900 || h > 900 {
+			if w < 100 || h < 100 || w > 900 || h > 900 {
 				continue
 			}
 			if w/h < 0.75 || w/h > 1.35 {
@@ -222,10 +267,18 @@ func cdpFindQRBoxDOM(ws *wsConn) *browserQRBox {
 					y = bm.Model.Content[i+1]
 				}
 			}
-			return &browserQRBox{X: x, Y: y, Width: w, Height: h}
+			key := fmt.Sprintf("%.0f:%.0f:%.0f:%.0f", x, y, w, h)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			boxes = append(boxes, browserQRBox{X: x, Y: y, Width: w, Height: h})
+			if len(boxes) >= maxBoxes {
+				return boxes
+			}
 		}
 	}
-	return nil
+	return boxes
 }
 
 // cdpQRPickPage 按平台挑页面：支付宝扫码可能另开标签页，此时不能再截原始 SSO 页。
@@ -272,6 +325,73 @@ func cdpQRPickPage(port int, platform string) (*wsConn, string, error) {
 	return ws, pick.URL, nil
 }
 
+// qrShotLooksLikeQR 用灰度统计判断截图到底是不是二维码。
+//
+// 靠 DOM 选择器 / 属性猜二维码并不可靠：实测豆包登录弹窗旁边有一张 171×164 的
+// 礼盒插画（远程 URL 的 <img>，class 里既没有 logo/decor 也不是内联 SVG），旧逻辑
+// 会把它当二维码截给用户；Qoder 支付宝二维码渲染前的首帧则是纯白空白图。
+//
+// 二维码的视觉特征很稳定：几乎只有纯黑/纯白，且水平/垂直方向高频黑白跳变；
+// 装饰插画、空白帧、营销 banner 在「暗像素占比」和「跳变率」上都接近 0。
+// 实测样本（64×64 采样）：
+//
+//	Trae 二维码      dark=0.36  bw=0.99  flip=0.38
+//	CodeArts 二维码  dark=0.51  bw=1.00  flip=0.35
+//	Qoder 二维码     dark=0.71  bw=0.87  flip=0.11
+//	豆包礼盒插画     dark=0.06  bw=0.71  flip=0.005
+//	整页截图         dark=0.03  bw=0.35  flip=0.020
+//
+// 阈值取 dark>=0.18 && bw>=0.75 && flip>=0.06，两边都留了足量余量。
+func qrShotLooksLikeQR(png []byte) bool {
+	img, _, err := image.Decode(bytes.NewReader(png))
+	if err != nil {
+		return false
+	}
+	b := img.Bounds()
+	if b.Dx() < 8 || b.Dy() < 8 {
+		return false
+	}
+	const n = 64
+	g := make([]float64, n*n)
+	for y := 0; y < n; y++ {
+		sy := b.Min.Y + (y*b.Dy()+b.Dy()/2)/n
+		for x := 0; x < n; x++ {
+			sx := b.Min.X + (x*b.Dx()+b.Dx()/2)/n
+			g[y*n+x] = float64(color.GrayModel.Convert(img.At(sx, sy)).(color.Gray).Y)
+		}
+	}
+	dark, light := 0, 0
+	for _, v := range g {
+		if v < 90 {
+			dark++
+		} else if v > 170 {
+			light++
+		}
+	}
+	flip := 0
+	for y := 0; y < n; y++ {
+		for x := 0; x < n-1; x++ {
+			a, c := g[y*n+x], g[y*n+x+1]
+			if (a < 90 && c > 170) || (a > 170 && c < 90) {
+				flip++
+			}
+		}
+	}
+	for x := 0; x < n; x++ {
+		for y := 0; y < n-1; y++ {
+			a, c := g[y*n+x], g[(y+1)*n+x]
+			if (a < 90 && c > 170) || (a > 170 && c < 90) {
+				flip++
+			}
+		}
+	}
+	total := float64(n * n)
+	flipRate := float64(flip) / float64(2*n*(n-1))
+	return float64(dark)/total >= 0.18 &&
+		float64(dark+light)/total >= 0.75 &&
+		flipRate >= 0.06
+}
+
 func cdpQRScreenshot(port int, platform string) (string, error) {
 	ws, pageURL, err := cdpQRPickPage(port, platform)
 	if err != nil {
@@ -280,36 +400,55 @@ func cdpQRScreenshot(port int, platform string) (string, error) {
 	defer ws.Close()
 
 	browserQRPrepareOnce(port, platform, ws)
-	box := cdpFindQRBoxDOM(ws)
-	if box == nil {
-		if raw, eerr := caEval(ws, browserQRFindJS); eerr == nil {
-			var found *browserQRBox
-			if json.Unmarshal(raw, &found) == nil {
-				box = found
+	// 二维码由登录页 JS 异步渲染：点完入口 / 页面刚打开时元素还没画出来，
+	// 而且页面里常并存同尺寸的装饰插画（豆包礼盒）和空白占位框。
+	// 所以每一轮都要「取多个候选框 → 逐个截图 → 校验图像内容」，只有真二维码
+	// 才返回；全部校验不通过就继续等待重试，绝不把装饰图或空白帧发给用户。
+	const maxAttempts = 10
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		// 营销弹窗可能晚于登录弹窗出现，所以每轮都清一次遮挡层；
+		// 对没有这类弹窗的平台是无副作用空操作。
+		_, _ = caEval(ws, browserQRDismissJS)
+		boxes := cdpFindQRBoxesDOM(ws)
+		if len(boxes) == 0 {
+			// DOM 域拿不到时退回网页 JS（同源 iframe / shadow DOM 场景）。
+			if raw, eerr := caEval(ws, browserQRFindJS); eerr == nil {
+				var found *browserQRBox
+				if json.Unmarshal(raw, &found) == nil && found != nil {
+					boxes = append(boxes, *found)
+				}
 			}
 		}
-	}
-	params := map[string]any{
-		"format":                "png",
-		"fromSurface":           true,
-		"captureBeyondViewport": false,
-	}
-	if box != nil && box.Width >= 72 && box.Height >= 72 {
-		params["clip"] = map[string]any{
-			"x": box.X, "y": box.Y, "width": box.Width, "height": box.Height, "scale": 1,
+		for _, box := range boxes {
+			if box.Width < 100 || box.Height < 100 {
+				continue
+			}
+			raw, serr := doubaoCDPCall(ws, 11, "Page.captureScreenshot", map[string]any{
+				"format":                "png",
+				"fromSurface":           true,
+				"captureBeyondViewport": false,
+				"clip": map[string]any{
+					"x": box.X, "y": box.Y, "width": box.Width, "height": box.Height, "scale": 1,
+				},
+			}, 20*time.Second)
+			if serr != nil {
+				continue
+			}
+			var shot struct {
+				Data string `json:"data"`
+			}
+			if json.Unmarshal(raw, &shot) != nil || shot.Data == "" {
+				continue
+			}
+			if decoded, derr := base64.StdEncoding.DecodeString(shot.Data); derr == nil && qrShotLooksLikeQR(decoded) {
+				return "data:image/png;base64," + shot.Data, nil
+			}
+		}
+		if attempt < maxAttempts-1 {
+			time.Sleep(400 * time.Millisecond)
 		}
 	}
-	raw, err := doubaoCDPCall(ws, 11, "Page.captureScreenshot", params, 20*time.Second)
-	if err != nil {
-		return "", fmt.Errorf("截图失败（%s）: %w", pageURL, err)
-	}
-	var shot struct {
-		Data string `json:"data"`
-	}
-	if err := json.Unmarshal(raw, &shot); err != nil || shot.Data == "" {
-		return "", fmt.Errorf("截图返回为空（%s）", pageURL)
-	}
-	return "data:image/png;base64," + shot.Data, nil
+	return "", fmt.Errorf("二维码尚未渲染（%s），请稍候", pageURL)
 }
 
 // browserQR 返回当前登录浏览器里的二维码截图。未找到二维码元素时返回整屏截图，
