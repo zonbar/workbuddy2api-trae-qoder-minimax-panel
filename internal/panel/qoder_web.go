@@ -38,6 +38,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -48,8 +49,29 @@ import (
 // qoderWebOrigin Qoder 网页控制台。
 const qoderWebOrigin = "https://qoder.com"
 
-// qoderWebAPI Qoder 开放接口（成长页就是它）。
-const qoderWebAPI = "https://openapi.qoder.sh"
+// qoderWebAPI Qoder 开放接口（成长页就是它）。国际站与国内站不是同一套域名，
+// 支付宝扫码登录属于国内站，会话 cookie 只能打国内 openapi。
+const (
+	qoderWebAPI   = "https://openapi.qoder.sh"
+	qoderWebAPICN = "https://openapi.qoder.com.cn"
+)
+
+// qoderSSOAlipayURL 构造国内版 Qoder 的阿里云 SSO 登录页。
+// 参数与网页端自己拼的完全一致：client_id / redirect_uri / return_url 固定，
+// nonce / state 每次随机，expireTime 取当前时间 +10 分钟。这样扫码登录不必
+// 依赖从浏览器里抄来的一次性链接，在容器里也能随时重新发起。
+func qoderSSOAlipayURL() string {
+	q := url.Values{}
+	q.Set("client_id", "qoder")
+	q.Set("expireTime", strconv.FormatInt(time.Now().Add(10*time.Minute).UnixMilli(), 10))
+	q.Set("nonce", randomHex(32))
+	q.Set("redirect_uri", "https://qoder.com.cn/sso/callback/aliyun")
+	q.Set("response_type", "code")
+	q.Set("return_url", "https://qoder.com.cn")
+	q.Set("scope", "openid profile")
+	q.Set("state", randomHex(32))
+	return "https://account.aliyun.com/sso/login.htm?" + q.Encode()
+}
 
 const qoderWebTTL = 30 * time.Minute
 
@@ -68,6 +90,14 @@ type qoderWebState struct {
 	done      bool
 	ok        bool
 	message   string
+	sso       bool // 支付宝扫码走国内站；普通网页登录走国际站
+}
+
+func (st *qoderWebState) apiBase() string {
+	if st != nil && st.sso {
+		return qoderWebAPICN
+	}
+	return qoderWebAPI
 }
 
 // qoderWebProfileDir 每号一个浏览器 profile（会话持久化 → 登录一次就够）。
@@ -94,6 +124,7 @@ func shortHash(s string) string {
 func (p *Panel) qoderWebStart(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Email string `json:"email"`
+		SSO   bool   `json:"sso"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	email := strings.TrimSpace(req.Email)
@@ -134,8 +165,13 @@ func (p *Panel) qoderWebStart(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "创建浏览器 profile 目录失败: "+err.Error())
 		return
 	}
+	// 扫码登录走国内版阿里云 SSO（支付宝扫码入口）；普通网页登录仍走国际站。
+	loginURL := qoderWebOrigin + "/account/usage"
+	if req.SSO {
+		loginURL = qoderSSOAlipayURL()
+	}
 	// 配置了出口代理的账号：登录环境与签到请求走同一个代理（否则"隔离"只隔离了一半）。
-	args := ideauth.QoderWebChromeArgs(port, dir, egress.ProxyURL, qoderWebOrigin+"/account/usage")
+	args := headlessBrowserArgs(ideauth.QoderWebChromeArgs(port, dir, egress.ProxyURL, loginURL))
 	cmd := exec.Command(chrome, args...)
 	if err := cmd.Start(); err != nil {
 		qoderWebSessions.mu.Unlock()
@@ -143,7 +179,7 @@ func (p *Panel) qoderWebStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	qoderWebSessions.by[email] = &qoderWebState{
-		email: email, port: port, dir: dir, proc: cmd, startedAt: time.Now(),
+		email: email, port: port, dir: dir, proc: cmd, startedAt: time.Now(), sso: req.SSO,
 	}
 	qoderWebSessions.mu.Unlock()
 	log.Printf("panel: Qoder 网页登录：%s（调试端口 %d，profile %s，代理 %s）",
@@ -182,6 +218,7 @@ func (p *Panel) qoderWebPoll(w http.ResponseWriter, r *http.Request) {
 	}
 	port := st.port
 	dir := st.dir
+	apiBase := st.apiBase()
 	qoderWebSessions.mu.Unlock()
 
 	all, err := cdpAllCookies(port)
@@ -196,7 +233,7 @@ func (p *Panel) qoderWebPoll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 用网页会话复现网页端自己的请求：先查活动列表。
-	status, body, err := qoderWebGet(jar, "/sash/api/v1/me/campaigns")
+	status, body, err := qoderWebGet(apiBase, jar, "/sash/api/v1/me/campaigns")
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": "等待浏览器就绪…"})
 		return
@@ -253,7 +290,7 @@ func (p *Panel) qoderWebPoll(w http.ResponseWriter, r *http.Request) {
 	ok := false
 	switch {
 	case claimID != "":
-		st2, b2, cerr := qoderWebPost(jar, "/sash/api/v1/me/campaigns/"+claimID+"/claim")
+		st2, b2, cerr := qoderWebPost(apiBase, jar, "/sash/api/v1/me/campaigns/"+claimID+"/claim")
 		if cerr == nil && st2 == http.StatusOK {
 			var r struct {
 				Status      string `json:"status"`
@@ -374,22 +411,22 @@ func qoderCookieJar(all []cdpCookie) (*cookiejar.Jar, []string) {
 }
 
 // qoderWebGet / qoderWebPost 用网页会话调 openapi（CookieJar 自动按域挑 cookie）。
-func qoderWebGet(jar *cookiejar.Jar, path string) (int, []byte, error) {
-	return qoderWebDo(jar, http.MethodGet, path, nil)
+func qoderWebGet(base string, jar *cookiejar.Jar, path string) (int, []byte, error) {
+	return qoderWebDo(base, jar, http.MethodGet, path, nil)
 }
 
-func qoderWebPost(jar *cookiejar.Jar, path string) (int, []byte, error) {
-	return qoderWebDo(jar, http.MethodPost, path, []byte("{}"))
+func qoderWebPost(base string, jar *cookiejar.Jar, path string) (int, []byte, error) {
+	return qoderWebDo(base, jar, http.MethodPost, path, []byte("{}"))
 }
 
-func qoderWebDo(jar *cookiejar.Jar, method, path string, body []byte) (int, []byte, error) {
+func qoderWebDo(base string, jar *cookiejar.Jar, method, path string, body []byte) (int, []byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	var rdr io.Reader
 	if len(body) > 0 {
 		rdr = strings.NewReader(string(body))
 	}
-	req, err := http.NewRequestWithContext(ctx, method, qoderWebAPI+path, rdr)
+	req, err := http.NewRequestWithContext(ctx, method, base+path, rdr)
 	if err != nil {
 		return 0, nil, err
 	}

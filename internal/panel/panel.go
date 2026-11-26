@@ -24,8 +24,8 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/ideauth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/minimax"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/minimax"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
@@ -174,11 +174,11 @@ func New(cfg Config) *Panel {
 		cfg.RedisMode = "noop"
 	}
 	p := &Panel{
-		cfg:     cfg,
-		mux:     http.NewServeMux(),
-		started: time.Now(),
-		logs:    NewRing(500),
-		logins:  map[string]loginSession{},
+		cfg:      cfg,
+		mux:      http.NewServeMux(),
+		started:  time.Now(),
+		logs:     NewRing(500),
+		logins:   map[string]loginSession{},
 		mmLogins: map[string]*minimax.DeviceSession{},
 	}
 	p.routes()
@@ -197,6 +197,11 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/{$}", p.index)
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
+	p.mux.HandleFunc("GET /panel/api/runtime", p.withAuth(p.runtimeInfo))
+	p.mux.HandleFunc("GET /panel/api/browser/qr", p.withAuth(p.browserQR))
+	// 凭据包：本机面板导出 → 容器面板导入，绕开容器内读不到客户端文件的限制。
+	p.mux.HandleFunc("GET /panel/api/export/bundle", p.withAuth(p.exportBundle))
+	p.mux.HandleFunc("POST /panel/api/import/bundle", p.withAuth(p.importBundle))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
 	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withAuth(p.requestMetrics))
 	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))

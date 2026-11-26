@@ -425,6 +425,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 }
 .state { font-size: 13px; color: var(--ink-2); display: flex; align-items: center; gap: 8px; }
 .state.ok { color: var(--ok); } .state.err { color: var(--bad); }
+.qr-img {
+  display: block; width: 220px; height: 220px; margin: 10px auto;
+  padding: 8px; background: #fff; border: 1px solid var(--line); border-radius: 10px;
+}
+.qr-shot {
+  display: block; max-width: 100%; max-height: 420px; margin: 10px auto;
+  padding: 6px; background: #fff; border: 1px solid var(--line); border-radius: 10px;
+}
 .dots::after { content: "…"; animation: blink 1.2s steps(4) infinite; }
 @keyframes blink { 0% { opacity: 1; } 50% { opacity: .3; } 100% { opacity: 1; } }
 
@@ -1813,9 +1821,18 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <button class="tab" data-tab="minimax">MiniMax</button>
         <button class="tab" data-tab="doubao">豆包</button>
         <button class="tab" data-tab="codearts">华为 CodeArts</button>
+        <button class="tab" data-tab="bundle">凭据包</button>
         <button class="tab" data-tab="import">导入 JSON</button>
       </div>
     </header>
+    <div id="addEnvNote" class="state hint" hidden style="margin:8px 14px 0">
+      当前运行在没有本机客户端的环境（容器 / 无桌面客户端）：读取客户端或客户端本体的入口已隐藏。容器内改用无头浏览器展示网页登录二维码，也可以导入「凭据包」或手动填写 Cookie / Token。
+    </div>
+    <div id="addBrowserQr" hidden style="margin:10px 14px 0;border:1px solid var(--line);border-radius:10px;padding:12px;text-align:center">
+      <div id="browserQrState" class="state" style="justify-content:center">正在打开登录页…</div>
+      <img id="browserQrImg" class="qr-shot" alt="登录二维码" hidden>
+      <div class="hint" style="margin-top:6px">用手机 App 扫描页面二维码；扫码确认后面板会自动获取账号并加入号池。</div>
+    </div>
     <div class="body">
       <!-- WorkBuddy 浏览器登录（国内版 / 国际版） -->
       <div id="addTabWb" class="tab-panel">
@@ -1828,14 +1845,22 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
         <div id="addLoad" class="state" hidden><span class="dots">正在获取授权链接</span></div>
         <div id="addReady" hidden>
-          <div class="state">在浏览器打开以下链接并登录：</div>
-          <div class="url" id="addUrl"></div>
-          <div class="state"><span class="dots">等待授权完成，自动检测中</span></div>
+          <div id="addQr" hidden>
+            <div class="state" style="justify-content:center">用手机扫码打开授权页并登录：</div>
+            <img id="addQrImg" class="qr-img" alt="授权二维码">
+            <div class="hint" style="text-align:center">扫码完成后无需其他操作，面板会自动获取凭证并加入号池。</div>
+          </div>
+          <div id="addUrlWrap">
+            <div class="state">在浏览器打开以下链接并登录：</div>
+            <div class="url" id="addUrl"></div>
+          </div>
+          <div class="state" style="margin-top:8px"><span class="dots">等待授权完成，自动检测中</span></div>
         </div>
         <div id="addDone" class="state ok" hidden></div>
         <div id="addErr" class="state err" hidden></div>
-        <div style="margin-top:10px">
-          <button id="btnWbSyncPool">同步本机已登录的 WorkBuddy 账号</button>
+        <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+          <button id="btnWbQr" class="primary">扫码登录</button>
+          <button id="btnWbSyncPool" data-local-only>同步本机已登录的 WorkBuddy 账号</button>
         </div>
       </div>
       <!-- Trae 登录（trae.cn，与 WorkBuddy 是两套独立账号体系） -->
@@ -1850,9 +1875,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div id="addTraeDone" class="state ok" hidden></div>
         <div id="addTraeErr" class="state err" hidden></div>
         <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
-          <button id="btnTraeStart" class="primary">打开登录窗口</button>
-          <button id="btnTraeStop" hidden>关闭登录窗口</button>
-          <button id="btnTraeClientSync">从本机客户端提取当前账号</button>
+          <button id="btnTraeQr" class="primary">扫码登录</button>
+          <button id="btnTraeStart" data-local-only>打开登录窗口</button>
+          <button id="btnTraeStop" hidden data-local-only>关闭登录窗口</button>
+          <button id="btnTraeClientSync" data-local-only>从本机客户端提取当前账号</button>
         </div>
       </div>
       <!-- Qoder：浏览器登录（客户端接管） / 捕获本机当前登录态 -->
@@ -1861,9 +1887,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div id="addQoderDone" class="state ok" hidden></div>
         <div id="addQoderErr" class="state err" hidden></div>
         <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
-          <button id="btnQoderWeb" class="primary">网页登录并添加</button>
-          <button id="btnQoderLogin">客户端浏览器登录</button>
-          <button id="btnQoderCapture">添加当前 Qoder 账号</button>
+          <button id="btnQoderQr" class="primary">扫码登录（支付宝）</button>
+          <button id="btnQoderWeb" data-local-only>网页登录并添加</button>
+          <button id="btnQoderLogin" data-local-only>客户端浏览器登录</button>
+          <button id="btnQoderCapture" data-local-only>添加当前 Qoder 账号</button>
         </div>
         <label class="hint" style="margin-top:10px;display:flex;gap:6px;align-items:flex-start;cursor:pointer">
           <input type="checkbox" id="chkQoderLogout" style="margin-top:2px">
@@ -1888,7 +1915,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div id="addMmDone" class="state ok" hidden></div>
         <div id="addMmErr" class="state err" hidden></div>
         <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
-          <button id="btnMmCapture" class="primary">添加当前 MiniMax 账号</button>
+          <button id="btnMmCapture" class="primary" data-local-only>添加当前 MiniMax 账号</button>
           <button id="btnMmToggleManual">改用粘贴 Token</button>
         </div>
         <div id="addMmManual" hidden style="margin-top:12px">
@@ -1905,12 +1932,21 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <label class="realm-opt"><input type="radio" name="mmRealm" value="global"> 国际版（Global）</label>
           </div>
           <div class="hint" style="margin-bottom:8px">
-            点击获取授权链接与设备码，在浏览器中完成授权即可自动入池（授权窗口有效期 5 分钟）。
+            扫码登录或获取授权链接与设备码，在手机 / 浏览器中完成授权即可自动入池（授权窗口有效期 5 分钟）。
           </div>
-          <button id="btnMmLogin" class="primary">浏览器登录添加账号</button>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button id="btnMmQr" class="primary">扫码登录</button>
+            <button id="btnMmLogin">浏览器登录添加账号</button>
+          </div>
           <div id="addMmLoginBox" hidden style="margin-top:10px">
-            <div class="state">在浏览器打开下面的链接，输入验证码完成登录：</div>
-            <div class="url" id="mmLoginUrl"></div>
+            <div id="mmLoginQrBox" hidden>
+              <div class="state" style="justify-content:center">用手机扫码完成授权：</div>
+              <img id="mmLoginQrImg" class="qr-img" alt="授权二维码">
+            </div>
+            <div id="mmLoginUrlWrap">
+              <div class="state">在浏览器打开下面的链接，输入验证码完成登录：</div>
+              <div class="url" id="mmLoginUrl"></div>
+            </div>
             <div class="state">验证码 <b id="mmLoginCode"></b> · 剩余 <span id="mmLoginCountdown">--</span></div>
             <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
               <button id="btnMmLoginOpen" class="primary">打开授权页</button>
@@ -1926,8 +1962,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div id="addDbDone" class="state ok" hidden></div>
         <div id="addDbErr" class="state err" hidden></div>
         <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
-          <button id="btnDbBrowser" class="primary">浏览器登录并添加</button>
-          <button id="btnDbClient">客户端登录并添加</button>
+          <button id="btnDbQr" class="primary">扫码登录</button>
+          <button id="btnDbBrowser" data-local-only>浏览器登录并添加</button>
+          <button id="btnDbClient" data-local-only>客户端登录并添加</button>
           <button id="btnDbToggleManual">改用粘贴 Cookie</button>
         </div>
         <div id="addDbBrowserBox" hidden style="margin-top:10px">
@@ -1951,12 +1988,36 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div id="addCaDone" class="state ok" hidden></div>
         <div id="addCaErr" class="state err" hidden></div>
         <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
-          <button id="btnCaAdd" class="primary">打开登录窗口</button>
-          <button id="btnCaStop" hidden>关闭登录窗口</button>
+          <button id="btnCaQr" class="primary">扫码登录</button>
+          <button id="btnCaAdd" data-local-only>打开登录窗口</button>
+          <button id="btnCaStop" hidden data-local-only>关闭登录窗口</button>
+          <button id="btnCaToggleManual">改用粘贴 Cookie</button>
         </div>
         <div id="addCaState" class="state" hidden style="margin-top:10px"><span class="dots">等待登录…</span></div>
+        <div id="addCaManual" hidden style="margin-top:12px">
+          <div class="hint" style="margin-bottom:6px">从浏览器 F12 → Network → 任意 /chat/ 请求 → Request Headers 复制整行 Cookie（HttpOnly 票据不能用 document.cookie 获取）。</div>
+          <textarea id="caCookieInput" rows="4" placeholder="Cookie: name=value; name2=value2; ..." style="width:100%;margin-bottom:8px"></textarea>
+          <input type="text" id="caLabelInput" placeholder="备注名（可选）" style="width:100%;margin-bottom:8px">
+          <button id="btnCaAddCookie" class="primary">保存账号</button>
+        </div>
         <div class="hint" style="margin-top:10px">
-          添加多个账号请依次点击「打开登录窗口」，每个账号自动分配独立隔离会话。
+          添加多个账号请依次点击「打开登录窗口」，每个账号自动分配独立隔离会话。容器环境请用上面的粘贴 Cookie 或「凭据包」。
+        </div>
+      </div>
+      <!-- 凭据包：本机导出 → 容器导入 -->
+      <div id="addTabBundle" class="tab-panel" hidden>
+        <div class="state" style="margin-bottom:8px">
+          在能访问客户端的本机面板点「导出凭据包」，下载 JSON 后上传到 NAS 的面板即可完成迁移；导入与手动 Cookie / Token 可以并存使用。
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <button id="btnBundleExport">从当前面板导出</button>
+          <input type="file" id="bundleFile" accept=".json,application/json">
+          <button id="btnBundleImport" class="primary">导入凭据包</button>
+        </div>
+        <div id="bundleDone" class="state ok" hidden style="margin-top:10px"></div>
+        <div id="bundleErr" class="state err" hidden style="margin-top:10px"></div>
+        <div class="hint" style="margin-top:10px">
+          凭据包含明文 Token / Cookie，请当作密码文件保管，导入后及时删除本机副本。文件不会写入任何客户端路径，也不会在容器内解密客户端数据。
         </div>
       </div>
       <!-- 导入 JSON -->

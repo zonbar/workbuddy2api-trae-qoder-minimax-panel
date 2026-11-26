@@ -73,12 +73,13 @@ func (p *Panel) doubaoBrowserStart(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "创建浏览器 profile 目录失败: "+err.Error())
 		return
 	}
-	cmd := exec.Command(chrome,
+	args := headlessBrowserArgs([]string{
 		fmt.Sprintf("--remote-debugging-port=%d", port),
-		"--user-data-dir="+dir,
+		"--user-data-dir=" + dir,
 		"--no-first-run", "--no-default-browser-check",
 		"https://www.doubao.com/",
-	)
+	})
+	cmd := exec.Command(chrome, args...)
 	if err := cmd.Start(); err != nil {
 		writeErr(w, http.StatusBadGateway, "启动浏览器失败: "+err.Error())
 		return

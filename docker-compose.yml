@@ -13,6 +13,9 @@ services:
     user: "${PUID:-10001}:${PGID:-10001}"
     environment:
       - TZ=Asia/Shanghai
+      # 容器内没有桌面客户端文件/DPAPI/浏览器：隐藏「从本机提取」类入口，
+      # 改用面板里的凭据包导入或手动 Cookie/Token。
+      - PANEL_LOCAL_CLIENT=0
     ports:
       - "7863:7863"
     volumes:

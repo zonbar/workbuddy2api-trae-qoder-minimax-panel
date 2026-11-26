@@ -165,7 +165,7 @@ func (p *Panel) codeartsBrowserStart(w http.ResponseWriter, r *http.Request) {
 			acc = codeartsFindAccount(pool, id)
 		}
 	}
-	args := codeartsChromeArgsForAccount(codeartsChromeArgs(port, dir, codeartsConsoleURL, false), acc)
+	args := headlessBrowserArgs(codeartsChromeArgsForAccount(codeartsChromeArgs(port, dir, codeartsConsoleURL, false), acc))
 	cmd := exec.Command(chrome, args...)
 	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
 	if err := cmd.Start(); err != nil {

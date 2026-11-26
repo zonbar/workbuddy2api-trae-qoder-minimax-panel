@@ -157,7 +157,19 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 	p.logins[st.State] = loginSession{created: time.Now(), realm: realm}
 	p.loginMu.Unlock()
 	log.Printf("panel: 发起 OAuth 添加账号 realm=%s（state=%s...）", realm, st.State[:min(8, len(st.State))])
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "url": st.AuthURL, "state": st.State, "realm": realm})
+	// 扫码登录：把同一个授权链接编成二维码，手机扫码后仍由本会话按 state 轮询，
+	// 因此不需要客户端路径或浏览器回调。生成失败时保留链接方式，不让登录整体失败。
+	qr, err := qrDataURL(st.AuthURL)
+	if err != nil {
+		log.Printf("panel: 生成授权二维码失败 realm=%s: %v", realm, err)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":    true,
+		"url":   st.AuthURL,
+		"qr":    qr,
+		"state": st.State,
+		"realm": realm,
+	})
 }
 
 // loginPoll 轮询登录态。未完成 → {done:false}；完成 → 建凭证、落盘、热加载、签到。

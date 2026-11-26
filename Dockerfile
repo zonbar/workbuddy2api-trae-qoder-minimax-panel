@@ -13,11 +13,17 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/wb2api ./cmd/serve
 
 FROM alpine:3.20
 # python3：login.sh 的 JSON 解析 / 签到 / 落盘；bash：shell 脚本体。
-RUN apk add --no-cache wget ca-certificates tzdata python3 bash \
+# chromium：无头浏览器扫码登录（Trae / Qoder / 豆包 / CodeArts 的二维码由网页绘制）。
+# 中文字体：登录页文案、二维码下方提示在截图里不能变方块。
+RUN apk add --no-cache wget ca-certificates tzdata python3 bash chromium font-noto-cjk \
+    nss freetype harfbuzz ttf-freefont \
  && adduser -D -u 10001 app \
  && mkdir -p /app/auths /app/data \
  && chown -R app:app /app
 WORKDIR /app
+# 容器里没有桌面客户端文件、DPAPI 密钥和可交互浏览器；隐藏相关入口，
+# 面板改用凭据包导入 / 手动 Cookie / Token。本机桌面运行可显式设 PANEL_LOCAL_CLIENT=1。
+ENV PANEL_LOCAL_CLIENT=0
 # 脚本置入 + 去 CRLF（Windows 检出可能性）在切到 app 之前以 root 完成——
 # app 对 root 所有文件无写权限，sed -i 需要写权限。
 COPY --from=build /out/wb2api /app/wb2api

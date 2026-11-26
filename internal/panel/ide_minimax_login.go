@@ -67,15 +67,22 @@ func (p *Panel) minimaxLoginStart(w http.ResponseWriter, r *http.Request) {
 	p.mmLoginMu.Unlock()
 
 	log.Printf("panel: 发起 MiniMax 设备码授权 region=%s（user_code=%s）", region, sess.UserCode)
+	// 扫码登录：设备码授权页本身支持手机打开，二维码里带上完整验证码链接，
+	// 扫完只需在手机上确认，面板继续按 state 轮询令牌并入池。
+	qr, err := qrDataURL(sess.VerifyURICComplete)
+	if err != nil {
+		log.Printf("panel: 生成 MiniMax 授权二维码失败 region=%s: %v", region, err)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":                      true,
-		"state":                   sess.State,
-		"region":                  region,
-		"user_code":               sess.UserCode,
-		"verification_uri":        sess.VerifyURI,
+		"ok":                        true,
+		"state":                     sess.State,
+		"region":                    region,
+		"user_code":                 sess.UserCode,
+		"verification_uri":          sess.VerifyURI,
 		"verification_uri_complete": sess.VerifyURICComplete,
-		"interval":                sess.Interval,
-		"expires_in":              int(time.Until(sess.ExpiresAt).Seconds()),
+		"qr":                        qr,
+		"interval":                  sess.Interval,
+		"expires_in":                int(time.Until(sess.ExpiresAt).Seconds()),
 	})
 }
 
@@ -129,13 +136,13 @@ func (p *Panel) minimaxLoginPoll(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("panel: MiniMax 浏览器登录成功：%s（%s）· %s", acc.Label, sess.Region, checkinMsg)
 		writeJSON(w, http.StatusOK, map[string]any{
-			"done":     true,
-			"id":       acc.ID,
-			"label":    acc.Label,
-			"added":    added,
-			"region":   sess.Region,
-			"msg":      fmt.Sprintf("已%s：%s", map[bool]string{true: "添加", false: "更新"}[added], acc.Label),
-			"checkin":  checkinMsg,
+			"done":    true,
+			"id":      acc.ID,
+			"label":   acc.Label,
+			"added":   added,
+			"region":  sess.Region,
+			"msg":     fmt.Sprintf("已%s：%s", map[bool]string{true: "添加", false: "更新"}[added], acc.Label),
+			"checkin": checkinMsg,
 		})
 	case minimax.DeviceDenied, minimax.DeviceExpired:
 		p.mmLoginMu.Lock()

@@ -56,6 +56,14 @@ var traeBrowserSession struct {
 
 // findChrome 找系统浏览器（优先 Chrome，回落 Edge）。
 func findChrome() (string, error) {
+	// 显式覆盖优先：容器里若自带浏览器或路径特殊，用环境变量指定即可。
+	for _, key := range []string{"WB2API_CHROME_PATH", "CHROME_BIN"} {
+		if p := strings.TrimSpace(os.Getenv(key)); p != "" {
+			if _, err := os.Stat(p); err == nil {
+				return p, nil
+			}
+		}
+	}
 	cands := []string{
 		`C:\Program Files\Google\Chrome\Application\chrome.exe`,
 		`C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`,
@@ -67,7 +75,37 @@ func findChrome() (string, error) {
 			return p, nil
 		}
 	}
-	return "", fmt.Errorf("未找到 Chrome / Edge，请先安装其中之一")
+	// 容器 / Linux / macOS 走 PATH：Alpine 镜像装的是 chromium，桌面可能装 Chrome。
+	for _, name := range []string{"chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "microsoft-edge"} {
+		if p, err := exec.LookPath(name); err == nil {
+			return p, nil
+		}
+	}
+	// macOS 常见安装位置（exec.LookPath 找不到 App 内的二进制）。
+	for _, p := range []string{
+		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+		"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+	} {
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("未找到 Chrome / Edge / Chromium，请先安装浏览器")
+}
+
+// headlessBrowserArgs 在无本机客户端的环境（容器）里给浏览器加无头参数。
+// 桌面环境保持原样，仍弹出可见窗口供用户直接操作。
+func headlessBrowserArgs(args []string) []string {
+	if localClientEnabled() {
+		return args
+	}
+	headless := []string{
+		"--headless=new", "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage",
+		"--window-size=1200,900", "--force-device-scale-factor=1", "--hide-scrollbars",
+		"--disable-extensions", "--disable-blink-features=AutomationControlled",
+		"--lang=zh-CN", "--accept-lang=zh-CN",
+	}
+	return append(headless, args...)
 }
 
 func freePort(ports []int) (int, error) {
@@ -131,12 +169,13 @@ func (p *Panel) traeBrowserStart(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "创建浏览器 profile 目录失败: "+err.Error())
 		return
 	}
-	cmd := exec.Command(chrome,
+	args := headlessBrowserArgs([]string{
 		fmt.Sprintf("--remote-debugging-port=%d", port),
-		"--user-data-dir="+dir,
+		"--user-data-dir=" + dir,
 		"--no-first-run", "--no-default-browser-check",
-		"https://www.trae.cn/",
-	)
+		"https://www.trae.cn/login",
+	})
+	cmd := exec.Command(chrome, args...)
 	if err := cmd.Start(); err != nil {
 		writeErr(w, http.StatusBadGateway, "启动浏览器失败: "+err.Error())
 		return

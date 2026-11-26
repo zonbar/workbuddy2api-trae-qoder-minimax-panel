@@ -4,7 +4,8 @@ const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'checkin';   // 账号池视图已移除（2026-10-24）：签到池是默认首页
 let overviewData = null, cfgLoaded = null;
-let logPin = true, loginState = null, loginTimer = null;
+let logPin = true, loginState = null, loginTimer = null, wbQrMode = false;
+let browserQrTimer = null, browserQrPlatform = '', browserQrEmail = '';
 let traeLoginState = null, traeTimer = null;   // Trae 授权登录（与 WorkBuddy 那套分开）
 let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
@@ -1394,6 +1395,10 @@ function openAdd() {
   resetMinimaxAddPanel();
   resetDoubaoAddPanel();
   resetCodeArtsAddPanel();
+  resetBundlePanel();
+  resetWbQr();
+  resetBrowserQr();
+  applyRuntimeMode();
   stopPoll(); stopTraePoll();
 }
 function switchAddTab(tab) {
@@ -1404,6 +1409,7 @@ function switchAddTab(tab) {
   $('addTabMinimax').hidden = tab !== 'minimax';
   $('addTabDoubao').hidden = tab !== 'doubao';
   $('addTabCodearts').hidden = tab !== 'codearts';
+  $('addTabBundle').hidden = tab !== 'bundle';
   $('addTabImport').hidden = tab !== 'import';
   // 页脚那组按钮只服务 WorkBuddy 设备码流程；其它流程有自己的按钮（在面板内）。
   const wb = tab === 'wb';
@@ -1419,13 +1425,37 @@ function switchAddTab(tab) {
 document.querySelectorAll('#addTabs .tab').forEach(b => {
   b.onclick = () => switchAddTab(b.dataset.tab);
 });
-function startAddLogin() {
+function resetWbQr() {
+  wbQrMode = false;
+  const qr = $('addQr'), img = $('addQrImg'), wrap = $('addUrlWrap');
+  if (qr) qr.hidden = true;
+  if (img) img.removeAttribute('src');
+  if (wrap) wrap.hidden = false;
+  const b = $('btnWbQr');
+  if (b) { b.hidden = false; b.disabled = false; }
+}
+function startAddLogin(qrMode) {
+  wbQrMode = !!qrMode;
   const realm = (document.querySelector('input[name="addRealm"]:checked') || {}).value || 'cn';
   $('btnStartLogin').disabled = true;
+  const qrBtn = $('btnWbQr');
+  if (qrBtn) qrBtn.disabled = true;
   $('addLoad').hidden = false; $('addErr').hidden = true;
   api('login/start', { method: 'POST', body: JSON.stringify({ realm }) }).then(r => {
     loginState = r.state;
+    // 链接始终写入 DOM，二维码模式下隐藏也能复用「复制 / 打开」两个兜底按钮。
     $('addUrl').textContent = r.url;
+    const img = $('addQrImg');
+    if (wbQrMode && r.qr && img) {
+      img.src = r.qr;
+      $('addQr').hidden = false;
+      $('addUrlWrap').hidden = true;
+      if (qrBtn) qrBtn.hidden = true;
+    } else {
+      $('addQr').hidden = true;
+      $('addUrlWrap').hidden = false;
+      if (qrBtn) qrBtn.disabled = false; // 二维码生成失败时保留按钮，可重试
+    }
     $('addPick').hidden = true; // 选域锁定（会话已按该域发起）
     $('addLoad').hidden = true; $('addReady').hidden = false;
     $('btnStartLogin').hidden = true;
@@ -1434,6 +1464,7 @@ function startAddLogin() {
   }).catch(e => {
     $('addLoad').hidden = true;
     $('btnStartLogin').disabled = false;
+    if (qrBtn) qrBtn.disabled = false;
     $('addErr').hidden = false;
     $('addErr').textContent = e.message;
   });
@@ -1459,9 +1490,180 @@ async function pollLogin() {
 }
 function closeAdd() {
   stopPoll(); stopTraePoll(); stopMmLoginPoll(); stopDbBrowserPoll(); stopQoderLoginPoll();
-  loginState = null; traeLoginState = null; $('addVeil').classList.remove('on');
+  loginState = null; traeLoginState = null; resetWbQr(); resetBrowserQr();
+  $('addVeil').classList.remove('on');
 }
 $('btnCloseAdd').onclick = closeAdd;
+
+/* ── 无头浏览器扫码登录 ─────────────────────────────────────────────────
+   Trae / Qoder / 豆包 / CodeArts 的二维码是网页自己画的，无法凭 URL 生成。
+   容器内启动无头浏览器 → 截取登录页二维码 → 手机扫码 → 沿用各平台原有
+   browser/poll 接口读浏览器会话并入池。桌面环境同样可用，只是浏览器无头。 */
+const browserQrFlows = {
+  trae:     { start: 'trae/browser/start',              poll: 'trae/browser/poll',              body: {} },
+  doubao:   { start: 'ide/doubao/browser/start',         poll: 'ide/doubao/browser/poll',         body: {} },
+  codearts: { start: 'ide/codearts/browser/start',       poll: 'ide/codearts/browser/poll',       body: {} },
+  qoder:    { start: 'ide/qoder/web/start',              poll: 'ide/qoder/web/poll',              body: { sso: true } },
+};
+function stopBrowserQrPoll() {
+  if (browserQrTimer) { clearInterval(browserQrTimer); browserQrTimer = null; }
+}
+function resetBrowserQr() {
+  stopBrowserQrPoll();
+  browserQrPlatform = ''; browserQrEmail = '';
+  const box = $('addBrowserQr'), img = $('browserQrImg'), st = $('browserQrState');
+  if (box) box.hidden = true;
+  if (img) { img.hidden = true; img.removeAttribute('src'); }
+  if (st) st.textContent = '正在打开登录页…';
+}
+function browserQrStatus(text) {
+  const st = $('browserQrState');
+  if (st) st.textContent = text || '';
+}
+async function refreshBrowserQrShot() {
+  if (!browserQrPlatform) return;
+  const qs = 'platform=' + encodeURIComponent(browserQrPlatform) +
+    (browserQrEmail ? '&email=' + encodeURIComponent(browserQrEmail) : '') +
+    '&t=' + Date.now();
+  try {
+    const r = await api('browser/qr?' + qs, { cache: 'no-store' });
+    const img = $('browserQrImg');
+    const statusText = {
+      new: '请用手机 App 扫描下方二维码',
+      authorizing: '已扫描，请在手机上确认授权',
+      authorized: '授权完成，正在获取账号…',
+      expired: '二维码已过期，请重新发起扫码登录',
+    };
+    let msg = statusText[r.qr_status] || '请用手机 App 扫描下方二维码';
+    if (r.qr_error === '427') msg = '二维码已过期，请重新发起扫码登录';
+    if (r.qr && img) { img.src = r.qr; img.hidden = false; browserQrStatus(msg); }
+    else browserQrStatus('等待登录页渲染二维码…');
+  } catch (e) {
+    browserQrStatus('等待登录页渲染二维码…（' + e.message + '）');
+  }
+}
+async function pollBrowserQrShot() {
+  const flow = browserQrFlows[browserQrPlatform];
+  if (!flow) return;
+  const suffix = flow === browserQrFlows.qoder
+    ? '?email=' + encodeURIComponent(browserQrEmail) : '';
+  try {
+    const r = await api(flow.poll + suffix);
+    if (r.done) {
+      stopBrowserQrPoll();
+      browserQrStatus(r.message || (r.ok ? '登录成功' : '登录未完成'));
+      loadOverview(true);
+      if (typeof reloadCurrentView === 'function') reloadCurrentView(true);
+      return;
+    }
+    if (r.expired || r.fatal) { stopBrowserQrPoll(); browserQrStatus(r.message || '登录已结束'); return; }
+    if (r.message) browserQrStatus(r.message);
+  } catch (e) {
+    // 浏览器刚启动、CDP 还没就绪时会短暂报错，下一轮继续。
+  }
+}
+async function startBrowserQr(platform, email) {
+  const flow = browserQrFlows[platform];
+  if (!flow) return;
+  resetBrowserQr();
+  browserQrPlatform = platform;
+  browserQrEmail = (email || '').trim();
+  const box = $('addBrowserQr'), img = $('browserQrImg');
+  if (box) box.hidden = false;
+  if (img) img.hidden = true;
+  browserQrStatus('正在启动无头浏览器并打开登录页…');
+  try {
+    const body = Object.assign({ email: browserQrEmail }, flow.body || {});
+    await api(flow.start, { method: 'POST', body: JSON.stringify(body) });
+  } catch (e) {
+    browserQrStatus('启动登录浏览器失败：' + e.message);
+    resetBrowserQr();
+    return;
+  }
+  await refreshBrowserQrShot();
+  browserQrTimer = setInterval(() => { refreshBrowserQrShot(); pollBrowserQrShot(); }, 2500);
+}
+function startQoderQr() {
+  const cur = $('addQoderCur') ? ($('addQoderCur').getAttribute('data-email') || '') : '';
+  const email = prompt('给哪个 Qoder 账号建立扫码登录会话？\n填邮箱（面板会为它建一个独立的无头浏览器会话）：', cur || '');
+  if (email && email.trim()) startBrowserQr('qoder', email.trim());
+}
+if ($('btnQoderQr')) $('btnQoderQr').onclick = startQoderQr;
+if ($('btnTraeQr')) $('btnTraeQr').onclick = () => startBrowserQr('trae');
+if ($('btnDbQr')) $('btnDbQr').onclick = () => startBrowserQr('doubao');
+if ($('btnCaQr')) $('btnCaQr').onclick = () => startBrowserQr('codearts');
+
+/* ── 运行环境与凭据包 ───────────────────────────────────────────────────
+   容器里既没有桌面客户端文件，也不能解密 DPAPI / 拉起浏览器。
+   运行环境由服务端告知；非本机环境只隐藏这些入口，手动 Cookie/Token 保留。 */
+let runtimeLocalClient = true;
+async function applyRuntimeMode() {
+  try {
+    const r = await api('runtime', { cache: 'no-store' });
+    runtimeLocalClient = r.local_client !== false;
+  } catch (e) { runtimeLocalClient = true; }
+  if (!runtimeLocalClient) {
+    document.querySelectorAll('#addVeil [data-local-only]').forEach(el => { el.hidden = true; });
+  }
+  const note = $('addEnvNote');
+  if (note) note.hidden = runtimeLocalClient;
+}
+function resetBundlePanel() {
+  const done = $('bundleDone'), err = $('bundleErr'), file = $('bundleFile');
+  if (done) { done.hidden = true; done.textContent = ''; }
+  if (err) { err.hidden = true; err.textContent = ''; }
+  if (file) file.value = '';
+}
+function authHeadersForUpload() {
+  const h = {};
+  const k = localStorage.getItem(LS_KEY);
+  if (k && /^[\x00-\xff]*$/.test(k)) h['Authorization'] = 'Bearer ' + k;
+  return h;
+}
+async function exportBundleFile() {
+  const btn = $('btnBundleExport');
+  btn.disabled = true; btn.textContent = '导出中…';
+  try {
+    const r = await fetch('/panel/api/export/bundle', { headers: authHeadersForUpload() });
+    if (r.status === 401) { openKey(); throw new Error('密钥无效或未填写'); }
+    if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.error || ('HTTP ' + r.status)); }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'credentials-bundle.json';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toast('凭据包已导出，请妥善保管', 'ok');
+  } catch (e) { toast('导出失败：' + e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '从当前面板导出'; }
+}
+async function importBundleFile() {
+  const btn = $('btnBundleImport');
+  const file = $('bundleFile') && $('bundleFile').files[0];
+  const done = $('bundleDone'), err = $('bundleErr');
+  if (!file) { err.hidden = false; err.textContent = '请先选择凭据包文件'; return; }
+  btn.disabled = true; btn.textContent = '导入中…';
+  done.hidden = true; err.hidden = true;
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    const r = await fetch('/panel/api/import/bundle', { method: 'POST', body: fd, headers: authHeadersForUpload() });
+    if (r.status === 401) { openKey(); throw new Error('密钥无效或未填写'); }
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    const counts = Object.entries(d.imported || {}).map(([k, v]) => k + ' ' + v);
+    done.hidden = false;
+    done.textContent = '导入完成' + (counts.length ? '：' + counts.join('，') : '（没有可导入的账号）') +
+      (d.skipped && Object.keys(d.skipped).length ? '；部分条目已跳过' : '');
+    if (d.errors && d.errors.length) console.warn('bundle import errors:', d.errors);
+    loadOverview(true);
+    if (typeof reloadCurrentView === 'function') reloadCurrentView(true);
+  } catch (e) {
+    err.hidden = false; err.textContent = '导入失败：' + e.message;
+  } finally { btn.disabled = false; btn.textContent = '导入凭据包'; }
+}
+if ($('btnBundleExport')) $('btnBundleExport').onclick = exportBundleFile;
+if ($('btnBundleImport')) $('btnBundleImport').onclick = importBundleFile;
 
 /* ── Trae 账号添加（面板自拉浏览器 + CDP 取凭证）────────────────────────
    与上面 WorkBuddy 的设备码流程是两套独立体系：账号落在 Trae 助手的
@@ -1734,7 +1936,7 @@ if ($('btnMmAddManual')) $('btnMmAddManual').onclick = doMmAddManual;
    两个实测约束决定了这段逻辑的形状：
      · 授权窗口只有 300 秒（上游 expires_in=300）→ 必须显示倒计时并允许重发；
      · 轮询快于服务端给的 interval 会拿到 slow_down → 轮询节奏跟着服务端走。 */
-let mmLoginState = null, mmLoginTimer = null, mmLoginCdTimer = null, mmLoginInterval = 3;
+let mmLoginState = null, mmLoginTimer = null, mmLoginCdTimer = null, mmLoginInterval = 3, mmQrMode = false;
 function stopMmLoginPoll() {
   if (mmLoginTimer) { clearTimeout(mmLoginTimer); mmLoginTimer = null; }
   if (mmLoginCdTimer) { clearInterval(mmLoginCdTimer); mmLoginCdTimer = null; }
@@ -1742,12 +1944,18 @@ function stopMmLoginPoll() {
 function resetMmLoginPanel() {
   stopMmLoginPoll();
   mmLoginState = null;
+  mmQrMode = false;
   const box = $('addMmLoginBox');
   if (box) box.hidden = true;
+  const qrBox = $('mmLoginQrBox'), qrImg = $('mmLoginQrImg'), urlWrap = $('mmLoginUrlWrap');
+  if (qrBox) qrBox.hidden = true;
+  if (qrImg) qrImg.removeAttribute('src');
+  if (urlWrap) urlWrap.hidden = false;
   const er = $('addMmLoginErr');
   if (er) { er.hidden = true; er.textContent = ''; }
-  const b = $('btnMmLogin');
+  const b = $('btnMmLogin'), qb = $('btnMmQr');
   if (b) { b.disabled = false; b.textContent = '浏览器登录添加账号'; }
+  if (qb) { qb.disabled = false; qb.hidden = false; }
 }
 function startMmCountdown(sec) {
   if (mmLoginCdTimer) clearInterval(mmLoginCdTimer);
@@ -1767,10 +1975,12 @@ function startMmCountdown(sec) {
   tick();
   mmLoginCdTimer = setInterval(tick, 1000);
 }
-async function startMmLogin() {
-  const b = $('btnMmLogin');
+async function startMmLogin(qrMode) {
+  mmQrMode = !!qrMode;
+  const b = $('btnMmLogin'), qb = $('btnMmQr');
   const er = $('addMmLoginErr');
-  b.disabled = true; b.textContent = '正在申请…';
+  if (b) { b.disabled = true; b.textContent = '正在申请…'; }
+  if (qb) qb.disabled = true;
   er.hidden = true; er.textContent = '';
   const realm = (document.querySelector('input[name="mmRealm"]:checked') || {}).value || 'cn';
   try {
@@ -1778,13 +1988,26 @@ async function startMmLogin() {
     mmLoginState = r.state;
     mmLoginInterval = Math.max(2, r.interval || 3);
     $('addMmLoginBox').hidden = false;
+    // 链接与验证码始终保留：二维码模式只是换一种打开方式，另一些用户仍可能需要手动复制。
     $('mmLoginUrl').textContent = r.verification_uri_complete || r.verification_uri || '';
     $('mmLoginCode').textContent = r.user_code || '';
-    b.disabled = false; b.textContent = '重新申请';
+    const img = $('mmLoginQrImg');
+    if (mmQrMode && r.qr && img) {
+      img.src = r.qr;
+      $('mmLoginQrBox').hidden = false;
+      $('mmLoginUrlWrap').hidden = true;
+      if (qb) qb.hidden = true;
+    } else {
+      $('mmLoginQrBox').hidden = true;
+      $('mmLoginUrlWrap').hidden = false;
+    }
+    if (b) { b.disabled = false; b.textContent = '重新申请'; }
+    if (qb) qb.disabled = false;
     startMmCountdown(r.expires_in || 300);
     mmLoginTimer = setTimeout(pollMmLogin, mmLoginInterval * 1000);
   } catch (e) {
-    b.disabled = false; b.textContent = '浏览器登录添加账号';
+    if (b) { b.disabled = false; b.textContent = '浏览器登录添加账号'; }
+    if (qb) qb.disabled = false;
     er.hidden = false; er.textContent = e.message;
   }
 }
@@ -1818,7 +2041,8 @@ async function pollMmLogin() {
     $('addMmLoginErr').textContent = e.message + '（关闭后重新添加）';
   }
 }
-if ($('btnMmLogin')) $('btnMmLogin').onclick = startMmLogin;
+if ($('btnMmLogin')) $('btnMmLogin').onclick = () => startMmLogin(false);
+if ($('btnMmQr')) $('btnMmQr').onclick = () => startMmLogin(true);
 if ($('btnMmLoginOpen')) $('btnMmLoginOpen').onclick = () => window.open($('mmLoginUrl').textContent, '_blank');
 if ($('btnMmLoginCopy')) $('btnMmLoginCopy').onclick = () => navigator.clipboard.writeText($('mmLoginCode').textContent)
   .then(() => toast('验证码已复制', 'ok'), () => toast('复制失败，请手动复制', 'err'));
@@ -1944,7 +2168,8 @@ if ($('btnDbToggleManual')) $('btnDbToggleManual').onclick = () => {
 };
 if ($('btnDbAddCookie')) $('btnDbAddCookie').onclick = doDbAddCookie;
 
-$('btnStartLogin').onclick = startAddLogin;
+$('btnStartLogin').onclick = () => startAddLogin(false);
+if ($('btnWbQr')) $('btnWbQr').onclick = () => startAddLogin(true);
 $('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');
 $('btnCopyUrl').onclick = () => navigator.clipboard.writeText($('addUrl').textContent)
   .then(() => toast('链接已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));
@@ -2131,6 +2356,7 @@ function refreshVisible() {
   else if (view === 'taskscenter') { reattachQueueView(); loadIdeaTasks(true); }
 }
 function start() {
+  applyRuntimeMode();
   loadOverview(true);
   if (refTimer) clearInterval(refTimer);
   refTimer = setInterval(refreshVisible, 5000);
@@ -6868,6 +7094,10 @@ function resetCodeArtsAddPanel() {
   if (d) d.hidden = true;
   if (e) e.hidden = true;
   if (b) b.hidden = true;
+  const man = $('addCaManual');
+  if (man) man.hidden = true;
+  const toggle = $('btnCaToggleManual');
+  if (toggle) toggle.textContent = '改用粘贴 Cookie';
 }
 
 // doCaCheckin 签到单个/全部（id 为空 = 全部）。
@@ -6905,6 +7135,32 @@ async function doCaRemove(id) {
 
 if ($('btnCaAdd')) $('btnCaAdd').onclick = doCaAdd;
 if ($('btnCaStop')) $('btnCaStop').onclick = doCaStop;
+
+// 手动粘贴 Cookie：后端已有 import_cookie 能力，这里补上界面入口。
+async function doCaAddCookie() {
+  const btn = $('btnCaAddCookie');
+  const done = $('addCaDone'), err = $('addCaErr');
+  btn.disabled = true;
+  done.hidden = true; err.hidden = true;
+  try {
+    const d = await api('ide/codearts/import_cookie', {
+      method: 'POST',
+      body: JSON.stringify({ cookie: $('caCookieInput').value, label: $('caLabelInput').value.trim() }),
+    });
+    if (!d.ok) { err.hidden = false; err.textContent = d.message || '导入失败'; return; }
+    done.hidden = false; done.className = 'state ok'; done.textContent = d.message || '已导入并验通';
+    $('caCookieInput').value = '';
+    loadCkCodeArts(true);
+  } catch (e) {
+    err.hidden = false; err.textContent = e.message;
+  } finally { btn.disabled = false; }
+}
+if ($('btnCaToggleManual')) $('btnCaToggleManual').onclick = () => {
+  const man = $('addCaManual');
+  man.hidden = !man.hidden;
+  $('btnCaToggleManual').textContent = man.hidden ? '改用粘贴 Cookie' : '收起粘贴框';
+};
+if ($('btnCaAddCookie')) $('btnCaAddCookie').onclick = doCaAddCookie;
 if ($('btnCaCheckinAll')) $('btnCaCheckinAll').onclick = () => doCaCheckin($('btnCaCheckinAll'));
 
 /* 总「一键签到」：主号池 / WorkBuddy / Qoder / MiniMax / CodeArts / Trae / 豆包 全部账号一次签完。
