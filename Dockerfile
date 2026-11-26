@@ -37,6 +37,9 @@ RUN sed -i 's/\r$//' /app/login.sh /app/signin.sh /app/credit.sh && chmod 755 /a
 COPY config.example.json /app/config.json
 USER app
 EXPOSE 7863
+# /healthz 是「业务可服务」探针：号池为空或全占满时按设计返回 503，
+# 不能当容器存活检查用（否则空号池的新部署永远显示 unhealthy）。
+# 面板入口恒 200 且无需鉴权，适合做进程存活探活；外部负载均衡仍应探 /healthz。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \
-  CMD wget -qO- http://127.0.0.1:7863/healthz || exit 1
+  CMD wget -qO- http://127.0.0.1:7863/panel/ >/dev/null || exit 1
 ENTRYPOINT ["/app/wb2api", "-config", "/app/config.json"]
