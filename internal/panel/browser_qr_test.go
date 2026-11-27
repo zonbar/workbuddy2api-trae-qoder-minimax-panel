@@ -6,50 +6,25 @@ import (
 	"image/color"
 	"image/draw"
 	"image/png"
-	"net/url"
-	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	qrcode "github.com/skip2/go-qrcode"
 )
 
-func TestQoderSSOAlipayURL(t *testing.T) {
-	before := time.Now().Add(9 * time.Minute).UnixMilli()
-	raw := qoderSSOAlipayURL()
-	after := time.Now().Add(11 * time.Minute).UnixMilli()
-	u, err := url.Parse(raw)
-	if err != nil {
-		t.Fatalf("parse SSO URL: %v", err)
+// TestQoderSSOStartsFromSiteSignIn 锁住「SSO 必须从站点自己的登录页起步」。
+//
+// 2026-11-27 实测：自己拼 account.aliyun.com/sso/login.htm?client_id=qoder... 时，
+// 阿里云照样出二维码、扫码也回调带回了 code，但
+// https://qoder.com.cn/sso/callback/aliyun 直接吐 "Bad Request"，
+// 一个会话 Cookie 都拿不到 —— 扫码登录永远「登录成功但没登录」。
+// 正确起点是 qoder 自己的 /users/sign-in，由页面自己发起 SSO。
+func TestQoderSSOStartsFromSiteSignIn(t *testing.T) {
+	if !strings.HasPrefix(qoderWebSignInURL, "https://qoder.com.cn/") {
+		t.Fatalf("SSO 起点必须是 qoder 自己的登录页，实际 %q", qoderWebSignInURL)
 	}
-	if u.Host != "account.aliyun.com" || u.Path != "/sso/login.htm" {
-		t.Fatalf("unexpected SSO endpoint: %s", raw)
-	}
-	q := u.Query()
-	for k, want := range map[string]string{
-		"client_id":     "qoder",
-		"redirect_uri":  "https://qoder.com.cn/sso/callback/aliyun",
-		"return_url":    "https://qoder.com.cn",
-		"response_type": "code",
-		"scope":         "openid profile",
-	} {
-		if got := q.Get(k); got != want {
-			t.Errorf("%s = %q, want %q", k, got, want)
-		}
-	}
-	exp, err := strconv.ParseInt(q.Get("expireTime"), 10, 64)
-	if err != nil || exp < before || exp > after {
-		t.Errorf("expireTime = %q, want within 10 minutes", q.Get("expireTime"))
-	}
-	if len(q.Get("nonce")) < 16 || len(q.Get("state")) < 16 {
-		t.Errorf("nonce/state too short: %q %q", q.Get("nonce"), q.Get("state"))
-	}
-	if q.Get("nonce") == q.Get("state") {
-		t.Error("nonce and state should differ")
-	}
-	if second := qoderSSOAlipayURL(); second == raw {
-		t.Error("consecutive SSO URLs should differ")
+	if strings.Contains(qoderWebSignInURL, "account.aliyun.com") {
+		t.Fatal("不能直接把浏览器开到阿里云 SSO 页：回调会 Bad Request")
 	}
 }
 

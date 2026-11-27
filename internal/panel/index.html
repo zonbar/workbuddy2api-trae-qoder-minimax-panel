@@ -1906,6 +1906,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="state" id="addQoderCur" style="margin-bottom:8px">正在读取本机 Qoder 登录态…</div>
         <div id="addQoderDone" class="state ok" hidden></div>
         <div id="addQoderErr" class="state err" hidden></div>
+        <!-- 扫码登录（支付宝）产出的网页会话账号：不进 IDE 号池，但会话有效、能每日签到 -->
+        <div id="addQoderWebList" class="state" hidden style="margin-top:6px"></div>
         <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
           <button id="btnQoderQr" class="primary">扫码登录（支付宝）</button>
           <button id="btnQoderWeb" data-local-only>网页登录并添加</button>
@@ -1925,8 +1927,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <div id="addQoderLoginErr" class="state err" hidden style="margin-top:8px"></div>
         </div>
         <div class="hint" style="margin-top:10px">
-          <b>网页登录</b>：独立浏览器会话，登录一次后每日自动签到，免重复登录。<br>
-          <b>客户端登录</b>：启动客户端完成扫码授权，面板自动收录。
+          <b>支付宝扫码</b>：面板在后台打开 Qoder 登录页并截取二维码，扫码后自动领取今日额度，会话保存在面板里 —— 之后每天自动签到，不用再登录。这类账号不进 IDE 号池，会列在上面的「网页会话账号」里。<br>
+          <b>网页登录（本地）</b>：在你自己的浏览器里登录，适合桌面环境。<br>
+          <b>客户端登录</b>：启动 Qoder 客户端完成扫码授权，面板自动收录进号池。
         </div>
       </div>
       <!-- MiniMax：浏览器登录（设备码）/ 捕获客户端登录态 / 粘贴 access+refresh token -->

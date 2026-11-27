@@ -51,7 +51,29 @@ func (p *Panel) qoderAccounts(w http.ResponseWriter, r *http.Request) {
 		"current_email":   cur,
 		"current_name":    curName,
 		"current_expires": curExpires,
+		// 网页会话账号：扫码登录（支付宝）产出的那批。它们不是 IDE 授权快照，
+		// 进不了号池，但会话有效、能签到 —— 不返回的话用户在界面上看不到
+		// 「账号到底加上没有」。
+		"web_accounts": p.qoderWebAccounts(),
 	})
+}
+
+// qoderWebAccounts 列出已保存的网页会话账号（供界面展示）。
+func (p *Panel) qoderWebAccounts() []map[string]any {
+	metas := listQoderWebSessions(qoderWebProfileRoot(p))
+	out := make([]map[string]any, 0, len(metas))
+	for _, m := range metas {
+		out = append(out, map[string]any{
+			"email":      m.Email,
+			"name":       m.Name,
+			"user_id":    m.UID,
+			"session":    m.SessionKey,
+			"saved_at":   m.SavedAt,
+			"api_cn":     m.APICN,
+			"identified": m.Email != "",
+		})
+	}
+	return out
 }
 
 // qoderAdd 把当前 Qoder 登录态保存进号池。

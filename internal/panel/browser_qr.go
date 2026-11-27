@@ -72,14 +72,37 @@ const browserQRFindJS = `(() => {
 
 // 有些平台首页只给一个「登录」入口，二维码藏在弹窗里。截图前点一次入口，
 // 让页面进入真正的扫码状态；每个调试端口只做一次，避免轮询时反复点击。
+//
+// Qoder 支付宝登录是三跳：qoder 登录页 → 阿里云 SSO → 支付宝扫码页。
+// 每一跳都要点对按钮，且**必须从 qoder 自己的登录页起步** —— 直接把浏览器
+// 开到阿里云 SSO 页时，回调会因为前端状态对不上而返回 Bad Request，
+// 一个会话 Cookie 都拿不到（2026-11-27 实测）。
 const browserQRPrepareJS = `(() => {
-  // 国内版 Qoder 走阿里云 SSO：底部第三方登录是支付宝图标，点它才出二维码。
-  if (location.href.indexOf('account.aliyun.com/sso/login.htm') >= 0) {
-    const alipay = document.querySelectorAll('[class*="alipay" i],[id*="alipay" i],[data-provider="alipay"],[aria-label*="支付宝"],[title*="支付宝"]');
+  const href = location.href;
+  // 支付宝扫码页本身就是二维码：页面上的「扫码登录 / 账密登录」是切换标签，
+  // 点错会把二维码切走，这里一律不点。
+  if (href.indexOf('alipay.com') >= 0) return JSON.stringify(false);
+  // 阿里云 SSO：第三方登录入口是底部的支付宝图标按钮。
+  if (href.indexOf('account.aliyun.com/sso/login.htm') >= 0) {
+    const alipay = document.querySelectorAll('.sso-third-party-icon-btn[title*="支付宝"],.sso-third-party-icon-btn[aria-label*="支付宝"],[class*="alipay" i],[id*="alipay" i],[data-provider="alipay"],[aria-label*="支付宝"],[title*="支付宝"]');
     for (const el of alipay) { try { el.click(); return JSON.stringify(true); } catch (e) {} }
     for (const el of document.querySelectorAll('button,a,div,span,[role="button"]')) {
       const t = (el.textContent || '').trim();
       if (t === '支付宝' || t === '支付宝登录') { try { el.click(); return JSON.stringify(true); } catch (e) {} }
+    }
+    return JSON.stringify(false);
+  }
+  // Qoder 国内站登录页：点「使用阿里云登录」，让站点自己发起 SSO。
+  if (href.indexOf('qoder.com.cn') >= 0) {
+    for (const el of document.querySelectorAll('a,button,[role="button"]')) {
+      const t = (el.textContent || '').trim();
+      if (t.indexOf('阿里云登录') >= 0 || t.indexOf('使用阿里云') >= 0) {
+        try { el.click(); return JSON.stringify(true); } catch (e) {}
+      }
+    }
+    for (const el of document.querySelectorAll('a,button,[role="button"]')) {
+      const t = (el.textContent || '').trim();
+      if (t === '登录' || t === '扫码登录' || t === 'Sign in') { try { el.click(); return JSON.stringify(true); } catch (e) {} }
     }
     return JSON.stringify(false);
   }

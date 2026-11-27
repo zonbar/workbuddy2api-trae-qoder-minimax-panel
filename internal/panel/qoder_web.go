@@ -39,7 +39,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -58,22 +57,24 @@ const (
 	qoderWebAPICN = "https://openapi.qoder.com.cn"
 )
 
-// qoderSSOAlipayURL 构造国内版 Qoder 的阿里云 SSO 登录页。
-// 参数与网页端自己拼的完全一致：client_id / redirect_uri / return_url 固定，
-// nonce / state 每次随机，expireTime 取当前时间 +10 分钟。这样扫码登录不必
-// 依赖从浏览器里抄来的一次性链接，在容器里也能随时重新发起。
-func qoderSSOAlipayURL() string {
-	q := url.Values{}
-	q.Set("client_id", "qoder")
-	q.Set("expireTime", strconv.FormatInt(time.Now().Add(10*time.Minute).UnixMilli(), 10))
-	q.Set("nonce", randomHex(32))
-	q.Set("redirect_uri", "https://qoder.com.cn/sso/callback/aliyun")
-	q.Set("response_type", "code")
-	q.Set("return_url", "https://qoder.com.cn")
-	q.Set("scope", "openid profile")
-	q.Set("state", randomHex(32))
-	return "https://account.aliyun.com/sso/login.htm?" + q.Encode()
-}
+// qoderWebSignInURL 国内版 Qoder 自己的登录页。
+//
+// ⚠️ 不要自己拼阿里云 SSO 链接。实测（2026-11-27）手工拼
+// account.aliyun.com/sso/login.htm?client_id=qoder&redirect_uri=... 时，
+// 阿里云照样能出二维码、扫码也回调带回了 code，但
+// https://qoder.com.cn/sso/callback/aliyun 直接吐
+// "Bad Request — Sorry, your request is invalid"，一个会话 Cookie 都拿不到。
+//
+// 原因是这条链路的前半段状态由 qoder 前端自己保管（nonce/state 与前端
+// 存储绑定，回调用它换会话）。从阿里云页面「空降」进去，回调时对不上，
+// 服务端就判请求非法。
+//
+// 正确做法是回到站点自己的登录页，让页面自己发起 SSO：
+//
+//	/users/sign-in → 点「使用阿里云登录」→ 阿里云 SSO → 点「支付宝」→ 扫码
+//
+// 这样整条链的参数与状态都是站点自己写的，回调能正常换到会话。
+const qoderWebSignInURL = "https://qoder.com.cn/users/sign-in"
 
 const qoderWebTTL = 30 * time.Minute
 
@@ -114,6 +115,14 @@ type qoderWebState struct {
 	// unauth 连续「已到应用页但接口 401」的次数。会话 Cookie 刚写入时接口
 	// 可能还不认，一次 401 就判死会把「其实已经登录成功」的号误杀。
 	unauth int
+	// throttleUntil / throttleN 上游 429 的退避窗口与连续次数。
+	//
+	// 前端 2.5 秒一轮，每轮都打 /me/campaigns —— 未登录时是 401，登录后是
+	// 真业务请求，连续几十次必然被限流（实测用户看到「查询活动失败 HTTP 429」）。
+	// 一旦 429，按 10s→20s→40s（上限 60s）退避，退避期内直接返回等待文案，
+	// 不再把请求打到上游 —— 越打越限，只会把「已经登录成功」的会话拖死。
+	throttleUntil time.Time
+	throttleN     int
 }
 
 func (st *qoderWebState) apiBase() string {
@@ -124,9 +133,17 @@ func (st *qoderWebState) apiBase() string {
 }
 
 // qoderWebProfileDir 每号一个浏览器 profile（会话持久化 → 登录一次就够）。
-func qoderWebProfileDir(p *Panel, email string) string {
+// qoderWebProfileRoot 网页会话 profile 的根目录（每个号一个子目录）。
+func qoderWebProfileRoot(p *Panel) string {
 	base := filepath.Join(traeBrowserBaseDir(p), "qoder-web")
-	dir := filepath.Join(base, shortHash(email))
+	if abs, err := filepath.Abs(base); err == nil {
+		base = abs
+	}
+	return base
+}
+
+func qoderWebProfileDir(p *Panel, email string) string {
+	dir := filepath.Join(qoderWebProfileRoot(p), shortHash(email))
 	if abs, err := filepath.Abs(dir); err == nil {
 		dir = abs
 	}
@@ -205,7 +222,7 @@ func (p *Panel) qoderWebStart(w http.ResponseWriter, r *http.Request) {
 	// 扫码登录走国内版阿里云 SSO（支付宝扫码入口）；普通网页登录仍走国际站。
 	loginURL := qoderWebOrigin + "/account/usage"
 	if req.SSO {
-		loginURL = qoderSSOAlipayURL()
+		loginURL = qoderWebSignInURL
 	}
 	// 配置了出口代理的账号：登录环境与签到请求走同一个代理（否则"隔离"只隔离了一半）。
 	args := headlessBrowserArgs(ideauth.QoderWebChromeArgs(port, dir, egress.ProxyURL, loginURL))
@@ -224,9 +241,14 @@ func (p *Panel) qoderWebStart(w http.ResponseWriter, r *http.Request) {
 	browserQRForget(port, "qoder")
 	log.Printf("panel: Qoder 网页登录：%s（调试端口 %d，profile %s，代理 %s）",
 		email, port, dir, firstNonEmpty(egress.ProxyURL, "进程默认"))
+	msg := "已打开浏览器（这个账号的独立会话），请登录要添加的 Qoder 账号 —— 登录一次即可，以后每天由面板自动签到"
+	if req.SSO {
+		// 扫码这条路是面板代点：登录页 → 使用阿里云登录 → 支付宝，用户什么都不用操作。
+		msg = "已打开 Qoder 登录页，正在准备支付宝二维码…"
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "running": true,
-		"message": "已打开浏览器（这个账号的独立会话），请登录要添加的 Qoder 账号 —— 登录一次即可，以后每天由面板自动签到",
+		"message": msg,
 	})
 }
 
@@ -271,14 +293,47 @@ func (p *Panel) qoderWebPoll(w http.ResponseWriter, r *http.Request) {
 		log.Printf("panel: Qoder 自动确认授权 %q", clicked)
 	}
 
+	// 回调页明确报错时立刻收尾：等下去不会有会话，只会耗到 30 分钟超时。
+	if broken, cur := qoderWebCallbackBroken(port); broken {
+		qoderWebSessions.mu.Lock()
+		st.done = true
+		st.ok = false
+		st.message = "登录回调被 Qoder 拒绝（回调页提示 Bad Request）。这次登录链接已失效，请重新点一次「扫码登录（支付宝）」，用要添加的账号重新扫。"
+		qoderWebSessions.mu.Unlock()
+		qoderWebClose(st)
+		log.Printf("panel: Qoder 回调页报错，本次登录作废（%s）", cur)
+		writeJSON(w, http.StatusOK, map[string]any{"done": true, "ok": false, "message": st.message})
+		return
+	}
+
 	all, err := cdpAllCookies(port)
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": "等待浏览器就绪…"})
 		return
 	}
 	jar, cookies := qoderCookieJar(all)
-	if len(cookies) == 0 {
+	// 只在「看起来已经登录」时才打业务接口。
+	//
+	// 之前只要有任意 qoder 域 Cookie 就打 /me/campaigns —— 而访客 Cookie
+	// （cna / tfstk / acw_tc / arms_uid ...）一进站就有，于是扫码还没完成就
+	// 每 2.5 秒打一次：未登录时全是 401，登录后又把接口打到 429。
+	// 用户看到的就是一串「查询活动失败 HTTP 429」+「等待在浏览器中完成登录」。
+	onApp, pageURL := qoderBrowserOnApp(port)
+	if len(cookies) == 0 || (!onApp && !qoderWebHasSessionCookie(all)) {
 		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": "等待在浏览器中完成 Qoder 登录…"})
+		return
+	}
+
+	// 429 退避窗口：越打越限，退避期内不再发请求。
+	qoderWebSessions.mu.Lock()
+	wait := time.Until(st.throttleUntil)
+	qoderWebSessions.mu.Unlock()
+	if wait > 0 {
+		secs := int(wait.Seconds()) + 1
+		writeJSON(w, http.StatusOK, map[string]any{
+			"done":    false,
+			"message": fmt.Sprintf("服务端限流，%d 秒后自动重试…", secs),
+		})
 		return
 	}
 
@@ -297,11 +352,35 @@ func (p *Panel) qoderWebPoll(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	if status == http.StatusTooManyRequests {
+		qoderWebSessions.mu.Lock()
+		st.throttleN++
+		backoff := 10 * time.Second << uint(min(st.throttleN-1, 3)) // 10s / 20s / 40s / 80s
+		if backoff > 60*time.Second {
+			backoff = 60 * time.Second
+		}
+		st.throttleUntil = time.Now().Add(backoff)
+		n := st.throttleN
+		qoderWebSessions.mu.Unlock()
+		log.Printf("panel: Qoder 活动接口返回 429，第 %d 次退避 %s", n, backoff)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"done":    false,
+			"message": fmt.Sprintf("服务端限流（HTTP 429），%d 秒后自动重试…", int(backoff.Seconds())),
+		})
+		return
+	}
+	if status == http.StatusOK {
+		// 能拿到活动列表就说明会话是有效的，退避计数清零。
+		qoderWebSessions.mu.Lock()
+		st.throttleN = 0
+		st.throttleUntil = time.Time{}
+		qoderWebSessions.mu.Unlock()
+	}
 	if status == http.StatusUnauthorized || status == http.StatusForbidden {
 		// 判定前先看浏览器停在哪：还在支付宝 / 阿里云 / qoder 登录页上时，
 		// qoder 域的那点 Cookie 只是访客态，401 说明「还没登完」，不是没权限。
 		// 以前这里一次 401 就判死并关掉浏览器，正是「扫码后立刻报授权失败」的原因。
-		if onApp, pageURL := qoderBrowserOnApp(port); !onApp {
+		if !onApp {
 			log.Printf("panel: Qoder 尚未完成登录（当前页 %s，HTTP %d），继续等待", firstNonEmpty(pageURL, "未知"), status)
 			writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": "等待在浏览器中完成 Qoder 登录…"})
 			return
@@ -391,20 +470,40 @@ func (p *Panel) qoderWebPoll(w http.ResponseWriter, r *http.Request) {
 
 	// 会话存进该账号的 profile 目录（cookies.json）：之后每天后台直接用，
 	// 过期了再用同一 profile 起一次浏览器抓新的。
-	if ok {
-		if err := saveQoderWebCookies(dir, all); err != nil {
-			log.Printf("panel: Qoder 网页会话落盘失败 %s: %v", email, err)
-		}
+	//
+	// ⚠️ 这里必须**无条件**保存：之前的条件是「领到了才存」，于是「今天已领过」
+	// 「服务端今天没下发额度」这些正常情况全都不落盘 —— 用户明明登录成功，
+	// 面板里却什么都没有，表现就是「账号还是没添加成功」。
+	// 能走到这里就说明 campaigns 返回了 200，会话本身是有效的，值得保存。
+	if err := saveQoderWebCookies(dir, all); err != nil {
+		log.Printf("panel: Qoder 网页会话落盘失败 %s: %v", email, err)
+	}
+	// 记下账号身份：号池接口与自动签到都靠它把「这份会话属于谁」认出来。
+	idEmail, idName, idUID := qoderWebIdentity(port, apiBase, jar, all)
+	if idEmail != "" && email == qoderSSOSessionKey {
+		email = idEmail
+	}
+	if err := saveQoderWebMeta(dir, qoderWebMeta{
+		Email: idEmail, Name: idName, UID: idUID,
+		SessionKey: email, APICN: st.sso, SavedAt: time.Now().Format(time.RFC3339),
+	}); err != nil {
+		log.Printf("panel: Qoder 网页会话身份落盘失败 %s: %v", email, err)
 	}
 	// 浏览器用完就关：留着窗口既占内存又让用户以为"还有事没做完"。
 	qoderWebClose(st)
+	if !ok {
+		// 没领到不代表失败：会话已保存，账号已记下，明天起自动签到能直接用它。
+		msg += "；网页会话已保存，账号已记下，之后每日自动签到会用它"
+	}
 	qoderWebSessions.mu.Lock()
 	st.done = true
 	st.ok = ok
 	st.message = msg
 	qoderWebSessions.mu.Unlock()
 	log.Printf("panel: Qoder 网页登录 %s -> %s", email, msg)
-	writeJSON(w, http.StatusOK, map[string]any{"done": true, "ok": ok, "message": msg, "email": email})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"done": true, "ok": ok, "message": msg, "email": email, "name": idName, "user_id": idUID,
+	})
 }
 
 // qoderWebClose 关掉这次登录用的浏览器进程（幂等）。
@@ -509,21 +608,386 @@ func qoderBrowserOnApp(port int) (bool, string) {
 	if err != nil {
 		return false, ""
 	}
+	cur := ""
 	for _, pg := range pages {
 		u, err := url.Parse(pg.URL)
 		if err != nil {
 			continue
 		}
+		if cur == "" && strings.Contains(strings.ToLower(u.Host), "qoder") {
+			cur = pg.URL
+		}
 		if !strings.Contains(strings.ToLower(u.Host), "qoder") {
 			continue
 		}
 		p := strings.ToLower(u.Path)
-		if strings.Contains(p, "login") || strings.Contains(p, "signin") || strings.Contains(p, "sso") {
+		if strings.Contains(p, "login") || strings.Contains(p, "signin") || strings.Contains(p, "sign-in") || strings.Contains(p, "sso") {
 			continue
 		}
 		return true, pg.URL
 	}
-	return false, ""
+	return false, cur
+}
+
+// qoderWebCurrentURL 返回浏览器当前停在哪（任意页面，用于日志与用户提示）。
+//
+// 之前只在「已进入应用页」时才返回 URL，其余情况一律空串，日志里就成了
+// 「当前页 未知」—— 恰好把最有用的线索（卡在哪个页面）丢掉了。
+func qoderWebCurrentURL(port int) string {
+	pages, err := caListPages(port)
+	if err != nil {
+		return ""
+	}
+	for _, pg := range pages {
+		if strings.Contains(strings.ToLower(pg.URL), "qoder") {
+			return pg.URL
+		}
+	}
+	if len(pages) > 0 {
+		return pages[0].URL
+	}
+	return ""
+}
+
+// qoderWebCallbackBroken 判断 SSO 回调页是否明确报错。
+//
+// 实测（2026-11-27）手工拼 SSO 链接时，浏览器会停在
+// https://qoder.com.cn/sso/callback/aliyun?code=... 并显示
+// "Bad Request — Sorry, your request is invalid"。
+// 这种情况下等多久都不会有会话：必须立刻告诉用户重来，
+// 而不是让它耗到 30 分钟超时后报「等待登录超时」。
+func qoderWebCallbackBroken(port int) (bool, string) {
+	cur := qoderWebCurrentURL(port)
+	if cur == "" || !strings.Contains(strings.ToLower(cur), "/sso/callback") {
+		return false, cur
+	}
+	ws, _, err := caPickPage(port)
+	if err != nil {
+		return false, cur
+	}
+	defer ws.Close()
+	raw, err := caEval(ws, qoderWebBodyTextJS)
+	if err != nil {
+		return false, cur
+	}
+	var text string
+	if json.Unmarshal(raw, &text) != nil {
+		return false, cur
+	}
+	low := strings.ToLower(text)
+	broken := strings.Contains(low, "bad request") || strings.Contains(low, "request is invalid") ||
+		strings.Contains(low, "invalid request")
+	return broken, cur
+}
+
+const qoderWebBodyTextJS = `(document.body ? document.body.innerText : '').slice(0, 600)`
+
+// qoderWebMeta 一份网页会话的账号身份（与 cookies.json 同目录）。
+//
+// 以前只存 cookies，谁也不知道这份会话属于哪个号：界面没法展示、自动签到也
+// 无法按号遍历，于是「扫码登录成功」在用户眼里等于「什么也没发生」。
+type qoderWebMeta struct {
+	Email      string `json:"email"`
+	Name       string `json:"name"`
+	UID        string `json:"uid"`
+	SessionKey string `json:"session_key"`
+	APICN      bool   `json:"api_cn"`
+	SavedAt    string `json:"saved_at"`
+	// Dir 是 profile 目录名（只在列出会话时填，不落盘）。
+	Dir string `json:"-"`
+}
+
+func qoderWebMetaPath(dir string) string { return filepath.Join(dir, "meta.json") }
+
+// saveQoderWebMeta 原子写 meta.json（0600）。
+func saveQoderWebMeta(dir string, m qoderWebMeta) error {
+	if strings.TrimSpace(dir) == "" {
+		return fmt.Errorf("empty dir")
+	}
+	buf, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := qoderWebMetaPath(dir) + ".tmp"
+	if err := os.WriteFile(tmp, buf, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, qoderWebMetaPath(dir))
+}
+
+// loadQoderWebMeta 读回 meta.json（不存在返回零值，不报错）。
+func loadQoderWebMeta(dir string) qoderWebMeta {
+	raw, err := os.ReadFile(qoderWebMetaPath(dir))
+	if err != nil {
+		return qoderWebMeta{}
+	}
+	var m qoderWebMeta
+	if json.Unmarshal(raw, &m) != nil {
+		return qoderWebMeta{}
+	}
+	return m
+}
+
+// listQoderWebSessions 列出所有可用的网页会话（有 cookies.json 的 profile 目录）。
+func listQoderWebSessions(root string) []qoderWebMeta {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+	out := make([]qoderWebMeta, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		dir := filepath.Join(root, e.Name())
+		if _, err := os.Stat(filepath.Join(dir, "cookies.json")); err != nil {
+			continue
+		}
+		m := loadQoderWebMeta(dir)
+		m.Dir = e.Name()
+		if m.SessionKey == "" {
+			m.SessionKey = e.Name()
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// qoderWebIdentity 尽力识别这次登录的账号身份。
+//
+// 扫码登录走的是阿里云 SSO，扫码前根本不知道会登进谁，所以身份只能在登录
+// 完成后反查：先问接口（最准），再退到页面存储里找邮箱/uid。
+// 两者都拿不到时返回空值 —— 调用方仍会保存会话，只是界面标注「未识别」。
+func qoderWebIdentity(port int, apiBase string, jar *cookiejar.Jar, all []cdpCookie) (email, name, uid string) {
+	for _, p := range []string{"/sash/api/v1/me", "/sash/api/v1/user/me", "/sash/api/v1/users/me"} {
+		st, body, err := qoderWebGet(apiBase, jar, p)
+		if err != nil || st != http.StatusOK {
+			continue
+		}
+		var m map[string]any
+		if json.Unmarshal(body, &m) != nil {
+			continue
+		}
+		e, n, u := pickQoderIdentity(m)
+		if e != "" || u != "" {
+			return e, n, u
+		}
+	}
+	if hdr := qoderRawCookieHeader(all, apiBase); hdr != "" {
+		for _, p := range []string{"/sash/api/v1/me", "/sash/api/v1/user/me"} {
+			st, body, err := qoderWebGetRaw(apiBase, hdr, p)
+			if err != nil || st != http.StatusOK {
+				continue
+			}
+			var m map[string]any
+			if json.Unmarshal(body, &m) != nil {
+				continue
+			}
+			e, n, u := pickQoderIdentity(m)
+			if e != "" || u != "" {
+				return e, n, u
+			}
+		}
+	}
+	// 退到页面：应用页一般把用户信息放在 localStorage / 全局对象里。
+	ws, _, err := caPickPage(port)
+	if err != nil {
+		return "", "", ""
+	}
+	defer ws.Close()
+	raw, err := caEval(ws, qoderWebIdentityJS)
+	if err != nil {
+		return "", "", ""
+	}
+	var got struct {
+		Email string `json:"email"`
+		Name  string `json:"name"`
+		UID   string `json:"uid"`
+	}
+	if json.Unmarshal(raw, &got) != nil {
+		return "", "", ""
+	}
+	return got.Email, got.Name, got.UID
+}
+
+// pickQoderIdentity 从任意层级的 JSON 里找出 email / name / uid。
+func pickQoderIdentity(m map[string]any) (email, name, uid string) {
+	var walk func(any)
+	walk = func(v any) {
+		switch t := v.(type) {
+		case map[string]any:
+			for k, val := range t {
+				lk := strings.ToLower(k)
+				if s, ok := val.(string); ok {
+					switch lk {
+					case "email", "mail", "useremail", "loginemail":
+						if email == "" && strings.Contains(s, "@") {
+							email = s
+						}
+					case "name", "nickname", "displayname", "username":
+						if name == "" && s != "" && !strings.Contains(s, "@") {
+							name = s
+						}
+					case "uid", "userid", "id":
+						if uid == "" && s != "" {
+							uid = s
+						}
+					}
+					continue
+				}
+				walk(val)
+			}
+		case []any:
+			for _, x := range t {
+				walk(x)
+			}
+		}
+	}
+	walk(m)
+	return
+}
+
+// qoderWebIdentityJS 在页面里找账号身份：先看常见全局对象，再扫 Web Storage。
+const qoderWebIdentityJS = `(() => {
+  const out = {email: '', name: '', uid: ''};
+  const emailRe = /[A-Za-z0-9._%+-]+\@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/;
+  const take = (obj) => {
+    if (!obj || typeof obj !== 'object') return;
+    for (const k of ['email', 'mail', 'userEmail', 'loginEmail']) {
+      if (!out.email && typeof obj[k] === 'string' && emailRe.test(obj[k])) out.email = obj[k];
+    }
+    for (const k of ['name', 'nickName', 'nickname', 'displayName', 'userName']) {
+      if (!out.name && typeof obj[k] === 'string' && obj[k] && !emailRe.test(obj[k])) out.name = obj[k];
+    }
+    for (const k of ['uid', 'userId', 'id']) {
+      if (!out.uid && (typeof obj[k] === 'string' || typeof obj[k] === 'number') && String(obj[k])) out.uid = String(obj[k]);
+    }
+  };
+  for (const g of ['__INITIAL_STATE__', '__NUXT__', '__NEXT_DATA__', 'userInfo', '__USER_INFO__']) {
+    try { take(window[g]); } catch (e) {}
+  }
+  const scan = (store) => {
+    try {
+      for (let i = 0; i < store.length; i++) {
+        const k = store.key(i), v = store.getItem(k) || '';
+        if (!out.email) { const m = v.match(emailRe); if (m) out.email = m[0]; }
+        if (/user|account|profile|auth/i.test(k)) {
+          try { take(JSON.parse(v)); } catch (e) {}
+        }
+      }
+    } catch (e) {}
+  };
+  scan(localStorage); scan(sessionStorage);
+  return JSON.stringify(out);
+})()`
+
+// qoderWebCheckinAll 用已保存的网页会话给每个账号领每日额度。
+//
+// 这条链路之前是断的：扫码登录会把 cookies.json 存下来，但**没有任何代码读它**
+// （loadQoderWebCookies 零调用点）。于是「登录一次后每天自动签到」只是一句
+// 承诺 —— 每天排程只跑 IDE 号池，网页会话账号根本不在其中。
+func (p *Panel) qoderWebCheckinAll() {
+	root := qoderWebProfileRoot(p)
+	metas := listQoderWebSessions(root)
+	if len(metas) == 0 {
+		return
+	}
+	claimed, already, pending, failed, expired := 0, 0, 0, 0, 0
+	for _, m := range metas {
+		all := loadQoderWebCookies(filepath.Join(root, m.Dir))
+		if len(all) == 0 {
+			continue
+		}
+		jar, _ := qoderCookieJar(all)
+		apiBase := qoderWebAPI
+		if m.APICN {
+			apiBase = qoderWebAPICN
+		}
+		label := firstNonEmpty(m.Email, m.SessionKey, m.Dir)
+
+		status, body, err := qoderWebGet(apiBase, jar, "/sash/api/v1/me/campaigns")
+		if err != nil {
+			log.Printf("panel: Qoder 网页会话签到 %s 请求失败: %v", label, err)
+			failed++
+			continue
+		}
+		if status == http.StatusUnauthorized || status == http.StatusForbidden {
+			if hdr := qoderRawCookieHeader(all, apiBase); hdr != "" {
+				if s2, b2, e2 := qoderWebGetRaw(apiBase, hdr, "/sash/api/v1/me/campaigns"); e2 == nil && s2 == http.StatusOK {
+					status, body = s2, b2
+				}
+			}
+		}
+		switch {
+		case status == http.StatusUnauthorized || status == http.StatusForbidden:
+			log.Printf("panel: Qoder 网页会话 %s 已失效（HTTP %d），需要在面板里重新扫码登录", label, status)
+			expired++
+			continue
+		case status == http.StatusTooManyRequests:
+			log.Printf("panel: Qoder 网页会话签到 %s 被限流（429），下一轮再试", label)
+			continue
+		case status != http.StatusOK:
+			log.Printf("panel: Qoder 网页会话签到 %s 失败 HTTP %d", label, status)
+			failed++
+			continue
+		}
+
+		var camps struct {
+			Campaigns []struct {
+				CampaignID  string `json:"campaignId"`
+				ActionType  string `json:"actionType"`
+				ClaimStatus string `json:"claimStatus"`
+				Benefit     struct {
+					Amount float64 `json:"amount"`
+				} `json:"benefit"`
+			} `json:"campaigns"`
+		}
+		if err := json.Unmarshal(body, &camps); err != nil {
+			log.Printf("panel: Qoder 网页会话签到 %s 活动列表解析失败: %v", label, err)
+			failed++
+			continue
+		}
+		claimID, amount, isAlready := "", 0.0, false
+		for _, c := range camps.Campaigns {
+			if c.ActionType != "CLAIM_BENEFIT" {
+				continue
+			}
+			if c.ClaimStatus == "CLAIMABLE" {
+				claimID, amount = c.CampaignID, c.Benefit.Amount
+				break
+			}
+			if c.ClaimStatus == "CLAIMED" {
+				isAlready, amount = true, c.Benefit.Amount
+			}
+		}
+		switch {
+		case claimID != "":
+			s2, b2, e2 := qoderWebPost(apiBase, jar, "/sash/api/v1/me/campaigns/"+claimID+"/claim")
+			if e2 != nil || s2 != http.StatusOK {
+				log.Printf("panel: Qoder 网页会话领取 %s 失败 HTTP %d %v", label, s2, e2)
+				failed++
+				continue
+			}
+			var r struct {
+				Status      string `json:"status"`
+				FailureCode string `json:"failureCode"`
+			}
+			_ = json.Unmarshal(b2, &r)
+			if r.Status == "CLAIMED" || r.Status == "SUCCESS" {
+				log.Printf("panel: Qoder 网页会话签到 %s 成功 +%.0f Credits", label, amount)
+				claimed++
+			} else {
+				log.Printf("panel: Qoder 网页会话签到 %s 被服务端拒绝：%s", label, r.FailureCode)
+				failed++
+			}
+		case isAlready:
+			already++
+		default:
+			pending++
+		}
+	}
+	log.Printf("panel: Qoder 网页会话签到完成：成功 %d / 今日已领 %d / 未下发 %d / 失败 %d / 已失效 %d",
+		claimed, already, pending, failed, expired)
 }
 
 // qoderRawCookieHeader 把 qoder 域下的 Cookie 直接拼成 Cookie 头。
@@ -612,6 +1076,40 @@ func loadQoderWebCookies(dir string) []cdpCookie {
 		return nil
 	}
 	return out
+}
+
+// qoderWebVisitorCookieNames 进站即有的访客 / 风控 Cookie 名单。
+//
+// 这些名字在「还没登录」时就已经存在（实测 2026-11-27 容器内 profile：
+// cna / isg / tfstk / acw_tc / arms_uid / qoder_locale / qoder_visitor_id）。
+// 用它们判断「有 Cookie ⇒ 已登录」会把扫码前当作已登录，于是一路打 401/429。
+var qoderWebVisitorCookieNames = map[string]bool{
+	"cna": true, "isg": true, "tfstk": true, "acw_tc": true, "arms_uid": true,
+	"qoder_locale": true, "qoder_visitor_id": true, "qoder_theme": true,
+	"_ga": true, "_gid": true, "_gat": true, "_ga_": true, "sensorsdata": true,
+	"aliyun_qi": true, "aliyun_lang": true, "aliyun_country": true, "login_aliyunid_csrf": true,
+}
+
+// qoderWebHasSessionCookie 判断 qoder 域上是否出现「访客之外」的 Cookie。
+//
+// 只用作「可以试着打业务接口」的前置条件，不是登录成功的判据 ——
+// 真正判据仍是 campaigns 返回 200。
+func qoderWebHasSessionCookie(all []cdpCookie) bool {
+	for _, c := range all {
+		host := strings.TrimPrefix(strings.ToLower(c.Domain), ".")
+		if !strings.Contains(host, "qoder") || c.Name == "" || c.Value == "" {
+			continue
+		}
+		name := strings.ToLower(c.Name)
+		if qoderWebVisitorCookieNames[name] {
+			continue
+		}
+		if strings.HasPrefix(name, "_ga_") || strings.HasPrefix(name, "sensorsdata") || strings.HasPrefix(name, "arms_") {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // qoderCookieJar 把抓到的 Cookie 装进 jar（按域规则），并返回登录态域名列表。

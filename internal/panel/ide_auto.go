@@ -95,6 +95,9 @@ func (p *Panel) StartMinimaxRenewAuto(ctx context.Context) {
 // ideCheckinAll 自动排程用的 IDE 号池全量签到（无 HTTP 上下文，结果只进日志）。
 func (p *Panel) ideCheckinAll(ctx context.Context) {
 	p.ideQoderCheckinAll()
+	// 网页会话账号（扫码登录产出）不走 IDE 号池，得单独遍历一遍，
+	// 否则「登录一次、以后每天自动签」只对号池里的号成立。
+	p.qoderWebCheckinAll()
 	p.ideWorkBuddyCheckinAll()
 	p.ideMiniMaxCheckinAll(ctx)
 	p.ideDoubaoCheckinAll(ctx)

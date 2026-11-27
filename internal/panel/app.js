@@ -6,6 +6,11 @@ let view = 'checkin';   // 账号池视图已移除（2026-10-24）：签到池�
 let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null, wbQrMode = false;
 let browserQrTimer = null, browserQrPlatform = '', browserQrEmail = '', browserQrShotBusy = false;
+// browserQrPollNote：登录轮询最近一次给用户的状态文案。
+// 截图轮询和登录轮询共用一个状态栏，扫码之后页面已经离开二维码页，截图必然
+// 失败 —— 如果它照旧写「等待登录页渲染二维码…」，就会把「等待在浏览器中完成
+// 登录」「服务端限流 30 秒后重试」这类真正有用的提示覆盖掉。
+let browserQrPollNote = '';
 // browserQrDone：本轮扫码已结束（成功/失败/超时）。结束那一刻可能还有一次
 // 截图请求在路上，它返回时浏览器已关、截图必然失败 —— 不挡住的话会把
 // 「登录成功」覆盖成「等待登录页渲染二维码…」，用户看到的就是「成功了却还在等」。
@@ -1518,7 +1523,7 @@ function stopBrowserQrPoll() {
 }
 function resetBrowserQr() {
   stopBrowserQrPoll();
-  browserQrPlatform = ''; browserQrEmail = ''; browserQrDone = false;
+  browserQrPlatform = ''; browserQrEmail = ''; browserQrDone = false; browserQrPollNote = '';
   const box = $('addBrowserQr'), img = $('browserQrImg'), st = $('browserQrState');
   if (box) box.hidden = true;
   if (img) { img.hidden = true; img.removeAttribute('src'); }
@@ -1554,7 +1559,7 @@ async function refreshBrowserQrShot() {
     let msg = statusText[r.qr_status] || '请用手机 App 扫描下方二维码';
     if (r.qr_error === '427') msg = '二维码已过期，请重新发起扫码登录';
     if (r.qr && img) { img.src = r.qr; img.hidden = false; browserQrStatus(msg); }
-    else { if (img) { img.hidden = true; img.removeAttribute('src'); } browserQrStatus('等待登录页渲染二维码…'); }
+    else { if (img) { img.hidden = true; img.removeAttribute('src'); } browserQrStatus(browserQrPollNote || '等待登录页渲染二维码…'); }
   } catch (e) {
     // 本轮已结束 / 已切平台：这次失败属于「过期请求」，不要动界面。
     if (browserQrDone || browserQrPlatform !== platformAtStart) return;
@@ -1570,7 +1575,7 @@ async function refreshBrowserQrShot() {
     }
     // 二维码未渲染时后端返回错误：清掉上一轮可能截错的图，统一显示等待态，
     // 不把内部错误详情（含 URL）暴露给用户，下一轮轮询会继续重试。
-    browserQrStatus('等待登录页渲染二维码…');
+    browserQrStatus(browserQrPollNote || '等待登录页渲染二维码…');
   } finally {
     browserQrShotBusy = false;
   }
@@ -1603,7 +1608,7 @@ async function pollBrowserQrShot() {
       browserQrStatus(r.message || '登录已结束', true);
       return;
     }
-    if (r.message) browserQrStatus(r.message);
+    if (r.message) { browserQrPollNote = r.message; browserQrStatus(r.message); }
   } catch (e) {
     // 浏览器刚启动、CDP 还没就绪时会短暂报错，下一轮继续。
   }
@@ -1630,7 +1635,16 @@ async function startBrowserQr(platform, email) {
     return;
   }
   await refreshBrowserQrShot();
-  browserQrTimer = setInterval(() => { refreshBrowserQrShot(); pollBrowserQrShot(); }, 2500);
+  // 截图 2.5 秒一轮（要尽快把二维码换到最新一帧）。
+  // 登录轮询对 Qoder 降到 7.5 秒一轮：它每轮都要打一次上游活动接口，
+  // 2.5 秒一次等于每分钟 24 次，未登录是 401、登录后直接 429 限流。
+  let tick = 0;
+  browserQrTimer = setInterval(() => {
+    refreshBrowserQrShot();
+    tick++;
+    const every = browserQrPlatform === 'qoder' ? 3 : 1;
+    if (tick % every === 0) pollBrowserQrShot();
+  }, 2500);
 }
 function startQoderQr() {
   const cur = $('addQoderCur') ? ($('addQoderCur').getAttribute('data-email') || '') : '';
@@ -1898,6 +1912,20 @@ async function loadQoderAddTab() {
     cur.textContent = d.current_email
       ? '本机当前登录：' + (d.current_name || '') + ' <' + d.current_email + '>'
       : '本机 Qoder 未登录 —— 请先登录 Qoder，再回来点「添加当前 Qoder 账号」。';
+    // 网页会话账号（扫码登录产出）单独列一行：它们不进 IDE 号池，
+    // 但会话已保存、每日自动签到会用它们 —— 不显示出来，用户会以为「没添加成功」。
+    const wl = $('addQoderWebList');
+    if (wl) {
+      const wa = d.web_accounts || [];
+      if (!wa.length) { wl.hidden = true; wl.textContent = ''; }
+      else {
+        const labels = wa.map(a => (a.email || ('会话 ' + String(a.session || '').slice(0, 8))) +
+          (a.identified ? '' : '（未识别账号）'));
+        wl.hidden = false;
+        wl.className = 'state ok';
+        wl.textContent = '已保存 ' + wa.length + ' 个网页会话账号：' + labels.join('、');
+      }
+    }
   } catch (e) { cur.className = 'state err'; cur.textContent = e.message; }
 }
 async function doQoderCapture() {
