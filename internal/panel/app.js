@@ -1402,6 +1402,10 @@ function openAdd() {
   stopPoll(); stopTraePoll();
 }
 function switchAddTab(tab) {
+  // 二维码区（#addBrowserQr）在 tab-panel **外面**，是全平台共用的公共区域，
+  // 切 tab 不会跟着隐藏。不在这里主动收起的话，会同时看到上一个平台残留的
+  // 二维码，而且 browserQrTimer 还在对着旧平台的浏览器截图。
+  if (browserQrPlatform && browserQrPlatform !== tab) resetBrowserQr();
   document.querySelectorAll('#addTabs .tab').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
   $('addTabWb').hidden = tab !== 'wb';
   $('addTabTrae').hidden = tab !== 'trae';
