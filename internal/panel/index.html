@@ -970,6 +970,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
         <div class="state" id="ckQoderState"><span class="dots">加载中</span></div>
         <div id="ckQoderList"></div>
+        <!-- 网页会话账号（扫码登录产出）：不进 IDE 号池，但会话有效、能每日签到。
+             不在这里列出来，号池为空时用户看到的就是"账号池是空的"，以为没加上。 -->
+        <div id="ckQoderWebList"></div>
         <!-- 一键签到的七相分桶结果（claimed/already/blocked/pending/failed/login_required/error） -->
         <div id="ckQoderBuckets"></div>
       </div>
@@ -1903,7 +1906,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </div>
       <!-- Qoder：浏览器登录（客户端接管） / 捕获本机当前登录态 -->
       <div id="addTabQoder" class="tab-panel" hidden>
-        <div class="state" id="addQoderCur" style="margin-bottom:8px">正在读取本机 Qoder 登录态…</div>
+        <div class="state" id="addQoderCur" style="margin-bottom:8px">正在读取 Qoder 登录态…</div>
         <div id="addQoderDone" class="state ok" hidden></div>
         <div id="addQoderErr" class="state err" hidden></div>
         <!-- 扫码登录（支付宝）产出的网页会话账号：不进 IDE 号池，但会话有效、能每日签到 -->
@@ -1937,9 +1940,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <div id="addQoderLoginErr" class="state err" hidden style="margin-top:8px"></div>
         </div>
         <div class="hint" style="margin-top:10px">
-          <b>支付宝扫码</b>：面板在后台打开 Qoder 登录页并截取二维码，扫码后自动领取今日额度，会话保存在面板里 —— 之后每天自动签到，不用再登录。这类账号不进 IDE 号池，会列在上面的「网页会话账号」里。<br>
-          <b>网页登录（本地）</b>：在你自己的浏览器里登录，适合桌面环境。<br>
-          <b>客户端登录</b>：启动 Qoder 客户端完成扫码授权，面板自动收录进号池。
+          <b>支付宝扫码</b>：面板在后台打开 Qoder 登录页并截取二维码，扫码后自动领取今日额度，会话保存在面板里 —— 之后每天自动签到，不用再登录。这类账号不进 IDE 号池，会列在「签到 → Qoder → 网页会话账号」里。<br>
+          <span data-local-only><b>网页登录（本地）</b>：在你自己的浏览器里登录，适合桌面环境。<br></span>
+          <span data-local-only><b>客户端登录</b>：启动 Qoder 客户端完成扫码授权，面板自动收录进号池。</span>
         </div>
       </div>
       <!-- MiniMax：浏览器登录（设备码）/ 捕获客户端登录态 / 粘贴 access+refresh token -->

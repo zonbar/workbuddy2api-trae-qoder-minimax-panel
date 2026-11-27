@@ -71,6 +71,8 @@ func (p *Panel) qoderWebAccounts() []map[string]any {
 			"saved_at":   m.SavedAt,
 			"api_cn":     m.APICN,
 			"identified": m.Email != "",
+			// 最近一次签到的结果：签到卡要用它显示「今天领到没有」。
+			"last_checkin": m.LastCheckin,
 		})
 	}
 	return out

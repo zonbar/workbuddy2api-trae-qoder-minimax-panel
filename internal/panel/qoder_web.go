@@ -40,6 +40,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -503,6 +504,20 @@ func (p *Panel) qoderWebPoll(w http.ResponseWriter, r *http.Request) {
 		msg = "登录成功，账号已添加；今天服务端没有可领的每日额度（可能已经领过，或同一人的另一个号已领走）"
 	}
 
+	// 把这次领取的结果也记成签到状态：签到卡上能立刻看到今天这个号的情况，
+	// 不用等下一轮自动签到才有数据。
+	chk := qoderWebCheckinResult{At: time.Now().Format(time.RFC3339), Msg: msg, Amount: amount}
+	switch {
+	case claimID != "" && ok:
+		chk.Phase = "claimed"
+	case claimID != "":
+		chk.Phase = "error"
+	case already:
+		chk.Phase = "already"
+	default:
+		chk.Phase = "pending"
+	}
+
 	// 会话存进该账号的 profile 目录（cookies.json）：之后每天后台直接用，
 	// 过期了再用同一 profile 起一次浏览器抓新的。
 	//
@@ -518,10 +533,14 @@ func (p *Panel) qoderWebPoll(w http.ResponseWriter, r *http.Request) {
 	if idEmail != "" && email == qoderSSOSessionKey {
 		email = idEmail
 	}
-	if err := saveQoderWebMeta(dir, qoderWebMeta{
+	meta := qoderWebMeta{
 		Email: idEmail, Name: idName, UID: idUID,
 		SessionKey: email, APICN: st.sso, SavedAt: time.Now().Format(time.RFC3339),
-	}); err != nil {
+		LastCheckin: &chk,
+	}
+	// meta.json 是整体覆写的；LastCheckin 用本次登录的真实领取结果覆盖即可
+	// （这次登录刚刚打过上游，比历史记录新）。
+	if err := saveQoderWebMeta(dir, meta); err != nil {
 		log.Printf("panel: Qoder 网页会话身份落盘失败 %s: %v", email, err)
 	}
 	// 浏览器用完就关：留着窗口既占内存又让用户以为"还有事没做完"。
@@ -721,6 +740,17 @@ const qoderWebBodyTextJS = `(document.body ? document.body.innerText : '').slice
 //
 // 以前只存 cookies，谁也不知道这份会话属于哪个号：界面没法展示、自动签到也
 // 无法按号遍历，于是「扫码登录成功」在用户眼里等于「什么也没发生」。
+// qoderWebCheckinResult 一次网页会话签到的结果。
+//
+// 落进 meta.json，界面与日志共用同一份 —— 否则「今天这个号到底领到没有」
+// 只能翻容器日志，用户在面板上永远看不到。
+type qoderWebCheckinResult struct {
+	Phase  string  `json:"phase"` // claimed / already / pending / expired / limited / error
+	Amount float64 `json:"amount"`
+	Msg    string  `json:"msg"`
+	At     string  `json:"at"`
+}
+
 type qoderWebMeta struct {
 	Email      string `json:"email"`
 	Name       string `json:"name"`
@@ -728,6 +758,8 @@ type qoderWebMeta struct {
 	SessionKey string `json:"session_key"`
 	APICN      bool   `json:"api_cn"`
 	SavedAt    string `json:"saved_at"`
+	// LastCheckin 最近一次签到的结果（自动签到与手动签到都写）。
+	LastCheckin *qoderWebCheckinResult `json:"last_checkin,omitempty"`
 	// Dir 是 profile 目录名（只在列出会话时填，不落盘）。
 	Dir string `json:"-"`
 }
@@ -950,113 +982,202 @@ const qoderWebIdentityJS = `(() => {
   return JSON.stringify(out);
 })()`
 
+// qoderWebCheckinSummary 一轮批量签到的计数。
+type qoderWebCheckinSummary struct {
+	Claimed int `json:"claimed"`
+	Already int `json:"already"`
+	Pending int `json:"pending"`
+	Failed  int `json:"failed"`
+	Expired int `json:"expired"`
+	Limited int `json:"limited"`
+}
+
+// qoderWebCheckinOne 给单个网页会话领一次每日额度，并把结果写回 meta.json。
+//
+// 网页会话和 IDE 号池是两条独立链路：前者手里只有 Cookie（打站点同源接口），
+// 后者是 IDE 授权快照。所以签到不能共用代码，但结果形态刻意保持一致
+// （claimed / already / pending / expired / error），界面才能用同一套徽章。
+func qoderWebCheckinOne(root string, m qoderWebMeta) qoderWebCheckinResult {
+	res := qoderWebCheckinResult{At: time.Now().Format(time.RFC3339)}
+	label := firstNonEmpty(m.Email, m.SessionKey, m.Dir)
+	// 不管成功、失败还是会话失效，结果都要落盘 —— 否则界面上这个号永远停在
+	// 「未签到」，用户根本看不出是没签、签失败、还是要重新登录。
+	defer func() {
+		if res.Phase == "" {
+			return
+		}
+		log.Printf("panel: Qoder 网页会话签到 %s → %s（%s）", label, res.Phase, res.Msg)
+		m.LastCheckin = &res
+		if err := saveQoderWebMeta(filepath.Join(root, m.Dir), m); err != nil {
+			log.Printf("panel: Qoder 网页会话 %s 签到结果落盘失败: %v", label, err)
+		}
+	}()
+	all := loadQoderWebCookies(filepath.Join(root, m.Dir))
+	if len(all) == 0 {
+		res.Phase, res.Msg = "expired", "会话里没有保存的 Cookie，需要重新扫码登录"
+		return res
+	}
+	jar, _ := qoderCookieJar(all)
+	apiBase := qoderWebAPI
+	if m.APICN {
+		apiBase = qoderWebAPICN
+	}
+
+	status, body, err := qoderWebGet(apiBase, jar, "/sash/api/v1/me/campaigns")
+	if err != nil {
+		res.Phase, res.Msg = "error", "请求上游失败："+err.Error()
+		return res
+	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		if hdr := qoderRawCookieHeader(all, apiBase); hdr != "" {
+			if s2, b2, e2 := qoderWebGetRaw(apiBase, hdr, "/sash/api/v1/me/campaigns"); e2 == nil && s2 == http.StatusOK {
+				status, body = s2, b2
+			}
+		}
+	}
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		res.Phase = "expired"
+		res.Msg = "会话已失效（HTTP " + strconv.Itoa(status) + "），需要重新扫码登录"
+		return res
+	case status == http.StatusTooManyRequests:
+		res.Phase, res.Msg = "limited", "上游限流（HTTP 429），下一轮再试"
+		return res
+	case status != http.StatusOK:
+		res.Phase, res.Msg = "error", "上游返回 HTTP "+strconv.Itoa(status)
+		return res
+	}
+
+	var camps struct {
+		Campaigns []struct {
+			CampaignID  string `json:"campaignId"`
+			ActionType  string `json:"actionType"`
+			ClaimStatus string `json:"claimStatus"`
+			Benefit     struct {
+				Amount float64 `json:"amount"`
+			} `json:"benefit"`
+		} `json:"campaigns"`
+	}
+	if err := json.Unmarshal(body, &camps); err != nil {
+		res.Phase, res.Msg = "error", "活动列表解析失败："+err.Error()
+		return res
+	}
+	claimID, amount, isAlready := "", 0.0, false
+	for _, c := range camps.Campaigns {
+		if c.ActionType != "CLAIM_BENEFIT" {
+			continue
+		}
+		if c.ClaimStatus == "CLAIMABLE" {
+			claimID, amount = c.CampaignID, c.Benefit.Amount
+			break
+		}
+		if c.ClaimStatus == "CLAIMED" {
+			isAlready, amount = true, c.Benefit.Amount
+		}
+	}
+	switch {
+	case claimID != "":
+		s2, b2, e2 := qoderWebPost(apiBase, jar, "/sash/api/v1/me/campaigns/"+claimID+"/claim")
+		if e2 != nil || s2 != http.StatusOK {
+			res.Phase = "error"
+			res.Msg = "领取接口返回 HTTP " + strconv.Itoa(s2)
+			if e2 != nil {
+				res.Msg = "领取请求失败：" + e2.Error()
+			}
+			break
+		}
+		var r struct {
+			Status      string `json:"status"`
+			FailureCode string `json:"failureCode"`
+		}
+		_ = json.Unmarshal(b2, &r)
+		if r.Status == "CLAIMED" || r.Status == "SUCCESS" {
+			res.Phase, res.Amount = "claimed", amount
+			res.Msg = fmt.Sprintf("已领取 +%.0f Credits", amount)
+		} else {
+			res.Phase = "error"
+			res.Msg = "服务端拒绝领取"
+			if r.FailureCode != "" {
+				res.Msg += "：" + r.FailureCode
+			}
+		}
+	case isAlready:
+		res.Phase, res.Amount = "already", amount
+		res.Msg = fmt.Sprintf("今天已领取（+%.0f Credits）", amount)
+	default:
+		res.Phase = "pending"
+		res.Msg = "服务端今天没有下发可领的每日额度"
+	}
+	return res
+}
+
 // qoderWebCheckinAll 用已保存的网页会话给每个账号领每日额度。
 //
 // 这条链路之前是断的：扫码登录会把 cookies.json 存下来，但**没有任何代码读它**
 // （loadQoderWebCookies 零调用点）。于是「登录一次后每天自动签到」只是一句
 // 承诺 —— 每天排程只跑 IDE 号池，网页会话账号根本不在其中。
-func (p *Panel) qoderWebCheckinAll() {
+func (p *Panel) qoderWebCheckinAll() qoderWebCheckinSummary {
+	var sum qoderWebCheckinSummary
 	root := qoderWebProfileRoot(p)
 	metas := listQoderWebSessions(root)
 	if len(metas) == 0 {
+		return sum
+	}
+	for _, m := range metas {
+		switch qoderWebCheckinOne(root, m).Phase {
+		case "claimed":
+			sum.Claimed++
+		case "already":
+			sum.Already++
+		case "pending":
+			sum.Pending++
+		case "expired":
+			sum.Expired++
+		case "limited":
+			sum.Limited++
+		default:
+			sum.Failed++
+		}
+	}
+	log.Printf("panel: Qoder 网页会话签到完成：成功 %d / 今日已领 %d / 未下发 %d / 失败 %d / 已失效 %d / 限流 %d",
+		sum.Claimed, sum.Already, sum.Pending, sum.Failed, sum.Expired, sum.Limited)
+	return sum
+}
+
+// qoderWebCheckin 给指定网页会话签一次到（界面上单个账号的「签到」按钮）。
+func (p *Panel) qoderWebCheckin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Email   string `json:"email"`
+		Session string `json:"session"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	root := qoderWebProfileRoot(p)
+	metas := listQoderWebSessions(root)
+	var hit *qoderWebMeta
+	for i := range metas {
+		m := &metas[i]
+		byEmail := req.Email != "" && (strings.EqualFold(m.Email, req.Email) ||
+			strings.EqualFold(m.SessionKey, req.Email) || strings.EqualFold(m.Dir, req.Email))
+		bySession := req.Session != "" && (m.SessionKey == req.Session || m.Dir == req.Session)
+		if byEmail || bySession {
+			hit = m
+			break
+		}
+	}
+	if hit == nil {
+		writeErr(w, http.StatusNotFound, "qoder_web_session_not_found")
 		return
 	}
-	claimed, already, pending, failed, expired := 0, 0, 0, 0, 0
-	for _, m := range metas {
-		all := loadQoderWebCookies(filepath.Join(root, m.Dir))
-		if len(all) == 0 {
-			continue
-		}
-		jar, _ := qoderCookieJar(all)
-		apiBase := qoderWebAPI
-		if m.APICN {
-			apiBase = qoderWebAPICN
-		}
-		label := firstNonEmpty(m.Email, m.SessionKey, m.Dir)
+	res := qoderWebCheckinOne(root, *hit)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     res.Phase == "claimed" || res.Phase == "already",
+		"result": res,
+	})
+}
 
-		status, body, err := qoderWebGet(apiBase, jar, "/sash/api/v1/me/campaigns")
-		if err != nil {
-			log.Printf("panel: Qoder 网页会话签到 %s 请求失败: %v", label, err)
-			failed++
-			continue
-		}
-		if status == http.StatusUnauthorized || status == http.StatusForbidden {
-			if hdr := qoderRawCookieHeader(all, apiBase); hdr != "" {
-				if s2, b2, e2 := qoderWebGetRaw(apiBase, hdr, "/sash/api/v1/me/campaigns"); e2 == nil && s2 == http.StatusOK {
-					status, body = s2, b2
-				}
-			}
-		}
-		switch {
-		case status == http.StatusUnauthorized || status == http.StatusForbidden:
-			log.Printf("panel: Qoder 网页会话 %s 已失效（HTTP %d），需要在面板里重新扫码登录", label, status)
-			expired++
-			continue
-		case status == http.StatusTooManyRequests:
-			log.Printf("panel: Qoder 网页会话签到 %s 被限流（429），下一轮再试", label)
-			continue
-		case status != http.StatusOK:
-			log.Printf("panel: Qoder 网页会话签到 %s 失败 HTTP %d", label, status)
-			failed++
-			continue
-		}
-
-		var camps struct {
-			Campaigns []struct {
-				CampaignID  string `json:"campaignId"`
-				ActionType  string `json:"actionType"`
-				ClaimStatus string `json:"claimStatus"`
-				Benefit     struct {
-					Amount float64 `json:"amount"`
-				} `json:"benefit"`
-			} `json:"campaigns"`
-		}
-		if err := json.Unmarshal(body, &camps); err != nil {
-			log.Printf("panel: Qoder 网页会话签到 %s 活动列表解析失败: %v", label, err)
-			failed++
-			continue
-		}
-		claimID, amount, isAlready := "", 0.0, false
-		for _, c := range camps.Campaigns {
-			if c.ActionType != "CLAIM_BENEFIT" {
-				continue
-			}
-			if c.ClaimStatus == "CLAIMABLE" {
-				claimID, amount = c.CampaignID, c.Benefit.Amount
-				break
-			}
-			if c.ClaimStatus == "CLAIMED" {
-				isAlready, amount = true, c.Benefit.Amount
-			}
-		}
-		switch {
-		case claimID != "":
-			s2, b2, e2 := qoderWebPost(apiBase, jar, "/sash/api/v1/me/campaigns/"+claimID+"/claim")
-			if e2 != nil || s2 != http.StatusOK {
-				log.Printf("panel: Qoder 网页会话领取 %s 失败 HTTP %d %v", label, s2, e2)
-				failed++
-				continue
-			}
-			var r struct {
-				Status      string `json:"status"`
-				FailureCode string `json:"failureCode"`
-			}
-			_ = json.Unmarshal(b2, &r)
-			if r.Status == "CLAIMED" || r.Status == "SUCCESS" {
-				log.Printf("panel: Qoder 网页会话签到 %s 成功 +%.0f Credits", label, amount)
-				claimed++
-			} else {
-				log.Printf("panel: Qoder 网页会话签到 %s 被服务端拒绝：%s", label, r.FailureCode)
-				failed++
-			}
-		case isAlready:
-			already++
-		default:
-			pending++
-		}
-	}
-	log.Printf("panel: Qoder 网页会话签到完成：成功 %d / 今日已领 %d / 未下发 %d / 失败 %d / 已失效 %d",
-		claimed, already, pending, failed, expired)
+// qoderWebCheckinAllHTTP 手动「全部签到」：把网页会话也一起签一遍。
+func (p *Panel) qoderWebCheckinAllHTTP(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "summary": p.qoderWebCheckinAll()})
 }
 
 // qoderRawCookieHeader 把 qoder 域下的 Cookie 直接拼成 Cookie 头。

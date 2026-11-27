@@ -1961,9 +1961,16 @@ async function loadQoderAddTab() {
   try {
     const d = await api('ide/qoder/accounts');
     cur.className = 'state';
-    cur.textContent = d.current_email
-      ? '本机当前登录：' + (d.current_name || '') + ' <' + d.current_email + '>'
-      : '本机 Qoder 未登录 —— 请先登录 Qoder，再回来点「添加当前 Qoder 账号」。';
+    if (d.current_email) {
+      cur.textContent = '本机当前登录：' + (d.current_name || '') + ' <' + d.current_email + '>';
+    } else if (!runtimeLocalClient) {
+      // 容器/无桌面环境里根本没有「本机 Qoder 客户端」这东西：提示用户先去登录本机，
+      // 只会让人一直在找一个不存在的东西。这里只留一条 —— 在这个环境里怎么加号。
+      cur.textContent = '当前环境没有本机 Qoder 客户端：Qoder 账号请用下面的「扫码登录（支付宝）」添加，' +
+        '会话以「网页会话账号」保存，之后每天自动签到。';
+    } else {
+      cur.textContent = '本机 Qoder 未登录 —— 请先登录 Qoder，再回来点「添加当前 Qoder 账号」。';
+    }
     // 当前登录邮箱记在 data-email 上：「用当前登录」按钮与网页登录默认值都读它。
     if (d.current_email) cur.setAttribute('data-email', d.current_email);
     else cur.removeAttribute('data-email');
@@ -5477,12 +5484,21 @@ async function loadQoderAccounts(quiet) {
     const cur = d.current_email || '';
     $('qoderSummary').textContent = cur
       ? '当前：' + cur + (d.current_expires ? '（到期 ' + String(d.current_expires).slice(0, 10) + '）' : '')
-      : '当前未登录';
+      : (runtimeLocalClient ? '当前未登录' : '容器环境：无本机客户端');
     if (!arr.length) {
       st.hidden = false; st.className = 'state';
-      st.textContent = cur
-        ? '号池为空。点右上角「添加账号 → Qoder」把当前登录账号存入号池。'
-        : '号池为空，且本机 Qoder 未登录。请先用某个账号登录 Qoder，再添加。';
+      if (cur) {
+        st.textContent = '号池为空。点右上角「添加账号 → Qoder」把当前登录账号存入号池。';
+      } else if (runtimeLocalClient) {
+        st.textContent = '号池为空，且本机 Qoder 未登录。请先用某个账号登录 Qoder，再添加。';
+      } else {
+        // 容器里这个视图管的是「桌面客户端账号池」，没有客户端就必然为空。
+        // 扫码登录的网页会话账号本来就不进号池，得指到它真正待的地方。
+        const wn = (d.web_accounts || []).length;
+        st.textContent = '这个视图是 Qoder 桌面客户端的账号池，容器里没有客户端，所以恒为空。' +
+          (wn ? '网页会话账号 ' + wn + ' 个：见「签到 → Qoder → 网页会话账号」。'
+              : '账号请用「添加账号 → Qoder → 扫码登录（支付宝）」添加，之后在「签到」页可见。');
+      }
       list.innerHTML = '';
       return;
     }
@@ -5625,7 +5641,19 @@ async function doQoderRemove(email) {
 async function doQoderCheckin(btn, email) {
   const old = btn ? btn.textContent : '签到';
   if (btn) { btn.disabled = true; btn.textContent = '签到中…'; }
+  // 网页会话账号走另一条链路（Cookie 打站点同源接口），跟号池一起签 ——
+  // 否则「全部签到」只动号池，卡片下半部分那组网页会话永远没反应。
+  const webP = api('ide/qoder/web/checkin-all', { method: 'POST', body: '{}' }).catch(() => null);
   try {
+    // 号池为空（容器里必然如此，没有本机客户端）：不要去打卡池接口 ——
+    // 它会回退成「签本机当前登录账号」，容器里必然 502，用户看到的就是「点签到没反应」。
+    if (qoderPoolCount === 0) {
+      const wd = await webP;
+      const ws = (wd && wd.summary) || {};
+      toast(qoderWebSummaryText(ws), (ws.claimed || ws.already) ? 'ok' : 'warn');
+      loadCkQoder(true);
+      return;
+    }
     // 点某一行 = 「今天让这个号先打」，但**仍然把池里所有号都打一遍**
     // （用户要求：一键领完所有号，不切号）。emails 留空 = 号池全部（后端语义）；
     // 服务端每日额度按**人**给、同一人一天只有一份、先打先得，所以顺序决定那 100 积分落到谁头上。
@@ -5668,6 +5696,11 @@ async function doQoderCheckin(btn, email) {
       text = 'Qoder 签到：' + parts.join(' · ');
     }
     const hardFail = failed + needLogin + errored;
+    // 网页会话那批的结果一并报出来，不然用户以为它们没被签。
+    const webD = await webP;
+    const ws = (webD && webD.summary) || null;
+    const webHit = ws && (ws.claimed || ws.already || ws.pending || ws.expired || ws.limited || ws.failed);
+    if (webHit) text += '｜' + qoderWebSummaryText(ws);
     toast(text, hardFail ? 'err' : ((blocked || pending) && !claimed && !already ? 'warn' : 'ok'));
     // 切号冻结期间不自动重绘（画面要保持切换前），只弹结果。
     if (!viewFrozen()) {
@@ -6350,6 +6383,9 @@ function renderQoderBuckets() {
 }
 
 let qoderRowsRequest = 0;
+// qoderPoolCount 上一次看到的号池数量（-1 = 还没读过）。「全部签到」要靠它
+// 判断有没有号池可签：容器里号池必然为空，再去打号池接口只会拿到 502。
+let qoderPoolCount = -1;
 async function loadCkQoder(quiet, fresh = false) {
   const st = $('ckQoderState'), list = $('ckQoderList');
   if (!st || !list) return;
@@ -6369,9 +6405,25 @@ async function loadCkQoder(quiet, fresh = false) {
     const arr = d.accounts || [];
     // 号池为空但本机有登录态：仍然展示当前号（后端会回退成「签当前账号」）。
     const rows = arr.length ? arr : (cur ? [{ email: cur, name: d.current_name || '当前登录', current: true }] : []);
+    qoderPoolCount = rows.length;
+    // 扫码登录产出的网页会话账号：与号池是两条独立链路，单独一组展示。
+    // 不渲染的话，容器里号池必然为空，用户只会看到「账号池是空的」。
+    renderQoderWebRows(d.web_accounts || []);
     if (!rows.length) {
       st.hidden = false; st.className = 'state';
-      st.textContent = '本机 Qoder 未登录，号池也为空。请先在 Qoder 登录，再到「IDE 账号池」点「添加账号」。';
+      const webN = (d.web_accounts || []).length;
+      if ($('ckQoderSummary')) {
+        $('ckQoderSummary').textContent = webN
+          ? ('号池为空 · 网页会话 ' + webN + ' 个')
+          : '号池为空';
+      }
+      if (webN) {
+        st.textContent = 'IDE 号池为空；下面 ' + webN + ' 个是扫码登录的网页会话账号，点它们右侧的「签到」即可。';
+      } else if (runtimeLocalClient) {
+        st.textContent = '本机 Qoder 未登录，号池也为空。请先在 Qoder 登录，再到「添加账号」点「添加当前 Qoder 账号」。';
+      } else {
+        st.textContent = '还没有 Qoder 账号。点「添加账号」→ Qoder →「扫码登录（支付宝）」，登录一次即可，之后每天自动签到。';
+      }
       list.innerHTML = '';
       renderQoderBuckets();
       return;
@@ -6581,6 +6633,99 @@ function renderQoderRows(rows, arr, cur, st2, eg) {
       }
     }).catch(e => { cell.innerHTML = '<span class="note">' + esc(e.message) + '</span>'; });
   });
+}
+
+/* renderQoderWebRows 渲染「网页会话账号」一组（扫码登录产出的那批）。
+   它们没有 IDE 授权快照 → 进不了号池，所以永远不出现在上面那张表里。
+   但会话是有效的、每天能领 100 Credits，不在这里列出来，容器用户看到的就是
+   「账号池是空的」，误以为账号没加上。
+   状态来自 meta.json 里最近一次签到结果（自动签到和手动签到都会写）。 */
+function renderQoderWebRows(web) {
+  const box = $('ckQoderWebList');
+  if (!box) return;
+  if (!web || !web.length) { box.innerHTML = ''; box.hidden = true; return; }
+  box.hidden = false;
+  const rows = web.map(a => {
+    const key = a.email || a.session || '';
+    const label = identLabel(key, '未识别账号');
+    const name = identName(a.name, key, '') || label;
+    const lc = a.last_checkin || null;
+    let status;
+    if (!lc) {
+      status = UI.badge('mute2', '○', '未签到', '这个会话还没有签到记录，点右侧「签到」试一次');
+    } else {
+      const when = caTime(lc.at) || lc.at || '';
+      const why = (lc.msg || '') + (when ? '（' + when + '）' : '');
+      if (lc.phase === 'claimed') status = UI.badge('ok', '✓', '今日已领 +' + Number(lc.amount || 0), why);
+      else if (lc.phase === 'already') status = UI.badge('ok', '✓', '今日已领', why);
+      else if (lc.phase === 'pending') status = UI.badge('mute2', '○', '今日无额度', why);
+      else if (lc.phase === 'expired') status = UI.badge('todo', '!', '需重新登录', why);
+      else if (lc.phase === 'limited') status = UI.badge('warn', '○', '上游限流', why);
+      else status = UI.badge('todo', '!', '签到失败', why);
+    }
+    return '<div class="trow" data-qw-row="' + esc(key) + '">' +
+      '<div class="who"><div class="nm">' + esc(name) +
+      '<span class="tag mute" style="margin-left:6px">网页会话</span></div>' +
+      '<div class="id">' + esc(label) + '</div></div>' +
+      '<div class="credits"><span class="note">网页会话 · 无余额接口</span></div>' +
+      '<div>' + status + '</div>' +
+      '<div class="acts">' +
+      UI.act('data-qw-checkin', key, '签到', '用这个网页会话去上游领今天的 100 Credits') +
+      UI.sub('data-qw-relogin', key, '重新扫码', '打开添加账号面板并预填这个邮箱，重新扫码登录') +
+      '</div></div>';
+  }).join('');
+  box.innerHTML =
+    '<div class="pad" style="padding-top:12px"><div class="ck-group" data-p="qoder">' +
+    '<span class="plat-badge" data-p="qoder">Qoder</span>' +
+    '<span class="cnt">网页会话账号 · 扫码登录（不进 IDE 号池，每天自动签到）</span></div></div>' +
+    '<div class="thead"><div>账号</div><div>积分</div><div>状态</div><div>操作</div></div>' + rows;
+  box.querySelectorAll('button[data-qw-checkin]').forEach(b => {
+    b.onclick = () => doQoderWebCheckin(b, b.dataset.qwCheckin);
+  });
+  box.querySelectorAll('button[data-qw-relogin]').forEach(b => {
+    b.onclick = () => qoderWebRelogin(b.dataset.qwRelogin);
+  });
+}
+
+function qoderWebSummaryText(s) {
+  const parts = [];
+  if (!s) return '网页会话签到：没有返回结果';
+  if (s.claimed) parts.push('已领取 ' + s.claimed);
+  if (s.already) parts.push('今日已领 ' + s.already);
+  if (s.pending) parts.push('今日无额度 ' + s.pending);
+  if (s.expired) parts.push('需重新登录 ' + s.expired);
+  if (s.limited) parts.push('限流 ' + s.limited);
+  if (s.failed) parts.push('失败 ' + s.failed);
+  if (!parts.length) return '没有可签到的网页会话账号';
+  return '网页会话签到：' + parts.join(' · ');
+}
+
+async function doQoderWebCheckin(btn, key) {
+  const old = btn ? btn.textContent : '签到';
+  if (btn) { btn.disabled = true; btn.textContent = '签到中…'; }
+  try {
+    const d = await api('ide/qoder/web/checkin', { method: 'POST', body: JSON.stringify({ email: key }) });
+    const r = (d && d.result) || {};
+    let text;
+    if (r.phase === 'claimed') text = '签到成功 +' + Number(r.amount || 0) + ' Credits（网页会话）';
+    else if (r.phase === 'already') text = '今日已领取（网页会话）';
+    else text = r.msg || '签到未完成';
+    const kind = (r.phase === 'claimed' || r.phase === 'already') ? 'ok'
+      : (r.phase === 'pending' || r.phase === 'limited' ? 'warn' : 'err');
+    toast(text, kind);
+    loadCkQoder(true);
+  } catch (e) { toast(e.message, 'err'); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = old || '签到'; } }
+}
+
+// qoderWebRelogin 从签到卡直接回到「添加账号 → Qoder」，并预填这个号的邮箱。
+function qoderWebRelogin(key) {
+  openAdd();
+  switchAddTab('qoder');
+  const el = qoderEmailEl();
+  if (el && key && String(key).includes('@')) el.value = key;
+  qoderEmailNote('', false);
+  toast('点「扫码登录（支付宝）」用这个账号扫码；同一浏览器会话已登录时会直接复用', 'ok');
 }
 
 /* ── MiniMax 签到（多账号）────────────────────────────────────────────
