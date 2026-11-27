@@ -6650,6 +6650,12 @@ function renderQoderWebRows(web) {
     const label = identLabel(key, '未识别账号');
     const name = identName(a.name, key, '') || label;
     const lc = a.last_checkin || null;
+    // 同一个号用「留空扫码」和「填邮箱登录」各登过一次，磁盘上就有两份会话。
+    // 后端已经把列表合并成一行，这里把副本数量标出来 —— 删的时候一起清掉。
+    const dups = Number(a.duplicates || 0);
+    const dupTag = dups
+      ? '<span class="tag mute" style="margin-left:6px" title="这个账号有多份会话副本（不同登录方式各存一份），点「删除」会一起清理">重复 ' + dups + '</span>'
+      : '';
     let status;
     if (!lc) {
       status = UI.badge('mute2', '○', '未签到', '这个会话还没有签到记录，点右侧「签到」试一次');
@@ -6665,13 +6671,15 @@ function renderQoderWebRows(web) {
     }
     return '<div class="trow" data-qw-row="' + esc(key) + '">' +
       '<div class="who"><div class="nm">' + esc(name) +
-      '<span class="tag mute" style="margin-left:6px">网页会话</span></div>' +
-      '<div class="id">' + esc(label) + '</div></div>' +
-      '<div class="credits"><span class="note">网页会话 · 无余额接口</span></div>' +
+      '<span class="tag mute" style="margin-left:6px">网页会话</span>' + dupTag + '</div>' +
+      // 昵称为空时 name 就是脱敏标识，别再重复渲染一行同样的字。
+      (name === label ? '' : '<div class="id">' + esc(label) + '</div>') + '</div>' +
+      '<div class="credits"><span class="note" title="网页会话走 Cookie 鉴权，没有余额接口，只能每日签到">无余额接口</span></div>' +
       '<div>' + status + '</div>' +
       '<div class="acts">' +
       UI.act('data-qw-checkin', key, '签到', '用这个网页会话去上游领今天的 100 Credits') +
       UI.sub('data-qw-relogin', key, '重新扫码', '打开添加账号面板并预填这个邮箱，重新扫码登录') +
+      UI.sub('data-qw-del', key, '删除', '删除这个网页会话账号（连同浏览器 profile 与重复副本），不可恢复') +
       '</div></div>';
   }).join('');
   box.innerHTML =
@@ -6685,6 +6693,48 @@ function renderQoderWebRows(web) {
   box.querySelectorAll('button[data-qw-relogin]').forEach(b => {
     b.onclick = () => qoderWebRelogin(b.dataset.qwRelogin);
   });
+  box.querySelectorAll('button[data-qw-del]').forEach(b => {
+    b.onclick = () => doQoderWebDelete(b, b.dataset.qwDel);
+  });
+}
+
+/* doQoderWebDelete 删除网页会话账号。
+   第一次点只把按钮变成「确认删除」（4 秒后自动还原），第二次才真的删 ——
+   不用 window.confirm：容器/远程访问下它可能被浏览器拦掉，表现是「点了没反应」。 */
+async function doQoderWebDelete(btn, key) {
+  if (!btn) return;
+  if (btn.dataset.armed !== '1') {
+    btn.dataset.armed = '1';
+    btn.dataset.old = btn.textContent;
+    btn.textContent = '确认删除';
+    btn.style.color = 'var(--bad)';
+    btn.style.borderColor = 'var(--bad)';
+    setTimeout(() => {
+      if (btn.dataset.armed !== '1') return;
+      btn.dataset.armed = '';
+      btn.textContent = btn.dataset.old || '删除';
+      btn.style.color = '';
+      btn.style.borderColor = '';
+    }, 4000);
+    return;
+  }
+  btn.dataset.armed = '';
+  btn.disabled = true;
+  btn.textContent = '删除中…';
+  try {
+    const d = await api('ide/qoder/web/delete', { method: 'POST', body: JSON.stringify({ email: key }) });
+    const n = (d && d.removed || []).length;
+    toast('已删除网页会话账号' + (n > 1 ? '（含 ' + (n - 1) + ' 份重复副本）' : ''), 'ok');
+    loadCkQoder(true);
+    loadQkCredits(true);
+    loadQoderAccounts(true);
+  } catch (e) {
+    toast(e.message, 'err');
+    btn.disabled = false;
+    btn.textContent = btn.dataset.old || '删除';
+    btn.style.color = '';
+    btn.style.borderColor = '';
+  }
 }
 
 function qoderWebSummaryText(s) {
@@ -7672,8 +7722,16 @@ async function loadQkCredits(quiet) {
     const arr = d.accounts || [];
     // 号池为空但本机有登录态：仍展示当前号。
     const rows = arr.length ? arr : (cur ? [{ email: cur, name: d.current_name || '当前登录', current: true }] : []);
-    if (!rows.length) {
-      st.hidden = false; st.className = 'state'; st.textContent = 'Qoder 号池为空，且本机未登录。'; tb.innerHTML = ''; return;
+    // 扫码登录产出的网页会话账号不进 IDE 号池，但它们每天都在签到、也有 100
+    // Credits/天的收益 —— 积分总览不列出来，用户看到的就是「账号是空的」。
+    const web = d.web_accounts || [];
+    if (!rows.length && !web.length) {
+      st.hidden = false; st.className = 'state';
+      st.textContent = runtimeLocalClient
+        ? 'Qoder 号池为空，且本机未登录。'
+        : '还没有 Qoder 账号。点「添加账号」→ Qoder →「扫码登录（支付宝）」添加。';
+      tb.innerHTML = '';
+      return;
     }
     st.hidden = true;
     tb.innerHTML = rows.map(a => {
@@ -7683,6 +7741,16 @@ async function loadQkCredits(quiet) {
         '<div class="id">' + esc(identLabel(email, '未设置')) + '</div></td>' +
         '<td class="num" data-qk-total="' + esc(email) + '"><span class="note">查询中…</span></td>' +
         '<td class="num" data-qk-gain="' + esc(email) + '"><b>+100</b></td></tr>';
+    }).join('') + web.map(a => {
+      // 网页会话账号：只有 Cookie，没有余额接口，但每天能领 100 Credits。
+      const key = a.email || a.session || '';
+      const label = identLabel(key, '未识别账号');
+      const name = identName(a.name, key, '') || label;
+      return '<tr><td class="who"><div class="nm">' + esc(name) +
+        '<span class="tag mute" style="margin-left:6px">网页会话</span></div>' +
+        (name === label ? '' : '<div class="id">' + esc(label) + '</div>') + '</td>' +
+        '<td class="num"><span class="note" title="网页会话走 Cookie 鉴权，没有余额接口">无余额接口</span></td>' +
+        '<td class="num"><b>+100</b><div class="note">每日签到</div></td></tr>';
     }).join('');
     // 逐号查额度：各账号用自己的 token，与「当前登录」无关。
     tb.querySelectorAll('[data-qk-total]').forEach(cell => {

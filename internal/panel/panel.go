@@ -295,6 +295,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/ide/qoder/web/start", p.withAuth(p.qoderWebStart))
 	p.mux.HandleFunc("GET /panel/api/ide/qoder/web/poll", p.withAuth(p.qoderWebPoll))
 	p.mux.HandleFunc("POST /panel/api/ide/qoder/web/checkin", p.withAuth(p.qoderWebCheckin))
+	p.mux.HandleFunc("POST /panel/api/ide/qoder/web/delete", p.withAuth(p.qoderWebDelete))
 	p.mux.HandleFunc("POST /panel/api/ide/qoder/web/checkin-all", p.withAuth(p.qoderWebCheckinAllHTTP))
 	p.mux.HandleFunc("POST /panel/api/ide/doubao/remove", p.withAuth(p.doubaoRemove))
 	p.mux.HandleFunc("POST /panel/api/ide/doubao/checkin", p.withAuth(p.doubaoCheckin))

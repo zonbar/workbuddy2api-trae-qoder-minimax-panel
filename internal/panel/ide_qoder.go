@@ -68,9 +68,13 @@ func (p *Panel) qoderWebAccounts() []map[string]any {
 			"name":       m.Name,
 			"user_id":    m.UID,
 			"session":    m.SessionKey,
+			"dir":        m.Dir,
 			"saved_at":   m.SavedAt,
 			"api_cn":     m.APICN,
 			"identified": m.Email != "",
+			// 同一账号的多余会话副本（先留空扫码、后又填邮箱登录会各留一份）。
+			// 界面合并成一行显示，删的时候一起清掉。
+			"duplicates": len(m.DupDirs),
 			// 最近一次签到的结果：签到卡要用它显示「今天领到没有」。
 			"last_checkin": m.LastCheckin,
 		})

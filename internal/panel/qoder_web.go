@@ -543,6 +543,11 @@ func (p *Panel) qoderWebPoll(w http.ResponseWriter, r *http.Request) {
 	if err := saveQoderWebMeta(dir, meta); err != nil {
 		log.Printf("panel: Qoder 网页会话身份落盘失败 %s: %v", email, err)
 	}
+	// 同一个号换过会话键再登录一次，磁盘上就有两份 profile —— 清掉旧的，
+	// 免得签到卡里同一个账号出现两行（用户会当成「重复添加」）。
+	if removed := pruneQoderWebDuplicates(qoderWebProfileRoot(p), dir, meta); len(removed) > 0 {
+		log.Printf("panel: Qoder 账号 %s 清理旧会话副本 %v", firstNonEmpty(meta.Email, meta.UID), removed)
+	}
 	// 浏览器用完就关：留着窗口既占内存又让用户以为"还有事没做完"。
 	qoderWebClose(st)
 	if !ok {
@@ -762,6 +767,26 @@ type qoderWebMeta struct {
 	LastCheckin *qoderWebCheckinResult `json:"last_checkin,omitempty"`
 	// Dir 是 profile 目录名（只在列出会话时填，不落盘）。
 	Dir string `json:"-"`
+	// DupDirs 是同一个账号的多余会话目录（只在列出会话时填，不落盘）。
+	//
+	// 同一个号被登录两次就有两份：先留空邮箱扫码（键 = sso），后来又填了邮箱
+	// 另建一份（键 = 邮箱）。两份 cookie 都有效、身份也认得出，界面上就是
+	// 「账号重复出现」—— 这里把它们折进主会话，界面上一个号只出现一次。
+	DupDirs []string `json:"-"`
+}
+
+// qoderWebSessionIdent 会话对应的账号身份键。
+//
+// 只有认得出身份（邮箱或 uid）的会话才参与去重：两段都空说明还没登录成功，
+// 按目录各自独立，不能当成同一个号。
+func qoderWebSessionIdent(m qoderWebMeta) string {
+	if e := strings.ToLower(strings.TrimSpace(m.Email)); e != "" {
+		return "email:" + e
+	}
+	if u := strings.TrimSpace(m.UID); u != "" {
+		return "uid:" + u
+	}
+	return ""
 }
 
 func qoderWebMetaPath(dir string) string { return filepath.Join(dir, "meta.json") }
@@ -795,8 +820,8 @@ func loadQoderWebMeta(dir string) qoderWebMeta {
 	return m
 }
 
-// listQoderWebSessions 列出所有可用的网页会话（有 cookies.json 的 profile 目录）。
-func listQoderWebSessions(root string) []qoderWebMeta {
+// readQoderWebSessions 原始列举：一个 profile 目录一条，不做合并。
+func readQoderWebSessions(root string) []qoderWebMeta {
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return nil
@@ -818,6 +843,96 @@ func listQoderWebSessions(root string) []qoderWebMeta {
 		out = append(out, m)
 	}
 	return out
+}
+
+// listQoderWebSessions 列出账号级会话：同一账号的多份 profile 合并成一条。
+//
+// 为什么要合并：扫码时可以留空邮箱（键 = sso），也可以填邮箱（键 = 邮箱），
+// 同一个号用两种方式各登录一次，就会在 data/qoder-web 下留两个目录。
+// 不合并的话界面上同一个号显示两行，用户会以为「重复添加了」。
+func listQoderWebSessions(root string) []qoderWebMeta {
+	all := readQoderWebSessions(root)
+	best := make(map[string]int, len(all))
+	for i := range all {
+		key := qoderWebSessionIdent(all[i])
+		if key == "" {
+			continue
+		}
+		j, ok := best[key]
+		if !ok {
+			best[key] = i
+			continue
+		}
+		win, lose := i, j
+		if !qoderWebMetaNewer(all[i], all[j]) {
+			win, lose = j, i
+		}
+		// 被合并的那份连同它自己的副本一起挂到胜者名下，_remove 时一并清理。
+		all[win].DupDirs = append(all[win].DupDirs, all[lose].Dir)
+		all[win].DupDirs = append(all[win].DupDirs, all[lose].DupDirs...)
+		// 签到状态取更新的那份，否则「今天已领」会被旧副本的空记录盖掉。
+		if qoderWebResultNewer(all[lose].LastCheckin, all[win].LastCheckin) {
+			all[win].LastCheckin = all[lose].LastCheckin
+		}
+		best[key] = win
+	}
+	out := make([]qoderWebMeta, 0, len(all))
+	for i := range all {
+		if key := qoderWebSessionIdent(all[i]); key != "" && best[key] != i {
+			continue
+		}
+		out = append(out, all[i])
+	}
+	return out
+}
+
+// qoderWebMetaNewer 判断两份会话哪份更新（SavedAt 为主，目录名兜底保证稳定）。
+func qoderWebMetaNewer(a, b qoderWebMeta) bool {
+	ta, ea := time.Parse(time.RFC3339, strings.TrimSpace(a.SavedAt))
+	tb, eb := time.Parse(time.RFC3339, strings.TrimSpace(b.SavedAt))
+	if ea == nil && eb == nil && !ta.Equal(tb) {
+		return ta.After(tb)
+	}
+	return a.Dir > b.Dir
+}
+
+// qoderWebResultNewer 判断签到记录哪个更新（nil 视为最旧）。
+func qoderWebResultNewer(a, b *qoderWebCheckinResult) bool {
+	if a == nil {
+		return false
+	}
+	if b == nil {
+		return true
+	}
+	ta, ea := time.Parse(time.RFC3339, a.At)
+	tb, eb := time.Parse(time.RFC3339, b.At)
+	if ea == nil && eb == nil {
+		return ta.After(tb)
+	}
+	return a.At > b.At
+}
+
+// pruneQoderWebDuplicates 删掉同一账号的旧副本（保留刚登录成功的 keepDir）。
+//
+// 新会话刚拿到 cookie，旧目录里的那份必然更旧；留着只会让界面出现重复条目，
+// 而且自动签到会拿旧 cookie 去换新 cookie，覆盖掉刚拿到的那份。
+func pruneQoderWebDuplicates(root, keepDir string, m qoderWebMeta) []string {
+	key := qoderWebSessionIdent(m)
+	if key == "" {
+		return nil
+	}
+	var removed []string
+	for _, o := range readQoderWebSessions(root) {
+		if o.Dir == keepDir || qoderWebSessionIdent(o) != key {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(root, o.Dir)); err != nil {
+			log.Printf("panel: 清理 Qoder 重复会话 %s 失败: %v", o.Dir, err)
+			continue
+		}
+		removed = append(removed, o.Dir)
+	}
+	return removed
 }
 
 // qoderWebIdentity 尽力识别这次登录的账号身份。
@@ -1178,6 +1293,88 @@ func (p *Panel) qoderWebCheckin(w http.ResponseWriter, r *http.Request) {
 // qoderWebCheckinAllHTTP 手动「全部签到」：把网页会话也一起签一遍。
 func (p *Panel) qoderWebCheckinAllHTTP(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "summary": p.qoderWebCheckinAll()})
+}
+
+// qoderWebDelete 删除网页会话账号（连同它的重复副本与浏览器 profile）。
+//
+// 会话文件只在 data/qoder-web 下，删完这个号就彻底没了：不再自动签到，
+// 面板里也不再出现。要恢复只能重新扫码登录 —— 所以界面上是二次确认。
+func (p *Panel) qoderWebDelete(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Email   string `json:"email"`
+		Session string `json:"session"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	target := strings.TrimSpace(firstNonEmpty(req.Email, req.Session))
+	if target == "" {
+		writeErr(w, http.StatusBadRequest, "email_required")
+		return
+	}
+	root := qoderWebProfileRoot(p)
+	metas := listQoderWebSessions(root)
+	var hit *qoderWebMeta
+	for i := range metas {
+		m := &metas[i]
+		if strings.EqualFold(m.Email, target) || m.SessionKey == target || m.Dir == target ||
+			(m.UID != "" && strings.EqualFold(m.UID, target)) {
+			hit = m
+			break
+		}
+	}
+	if hit == nil {
+		writeErr(w, http.StatusNotFound, "qoder_web_session_not_found")
+		return
+	}
+	dirs := append([]string{hit.Dir}, hit.DupDirs...)
+	// 正在跑的浏览器先关掉：留着它会继续往刚删掉的 profile 里写 cookie。
+	// 按目录（而不是会话键）匹配 —— 同一账号可能有 sso / 邮箱两个键在跑。
+	live := make(map[string]bool, len(dirs))
+	for _, d := range dirs {
+		live[filepath.Join(root, d)] = true
+	}
+	qoderWebSessions.mu.Lock()
+	for k, st := range qoderWebSessions.by {
+		if live[st.dir] || strings.EqualFold(k, hit.Email) || strings.EqualFold(k, hit.SessionKey) {
+			qoderWebClose(st)
+			delete(qoderWebSessions.by, k)
+		}
+	}
+	qoderWebSessions.mu.Unlock()
+
+	removed := make([]string, 0, len(dirs))
+	for _, d := range dirs {
+		// 目录名只可能是 shortHash 出来的 12 位 hex：不符就跳过，
+		// 避免任何形式的路径穿越把 RemoveAll 带到数据目录外面。
+		if !qoderWebDirNameOK(d) {
+			log.Printf("panel: 拒绝删除可疑的 Qoder 会话目录 %q", d)
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(root, d)); err != nil {
+			log.Printf("panel: 删除 Qoder 会话 %s 失败: %v", d, err)
+			continue
+		}
+		removed = append(removed, d)
+	}
+	if len(removed) == 0 {
+		writeErr(w, http.StatusInternalServerError, "qoder_web_delete_failed")
+		return
+	}
+	label := firstNonEmpty(hit.Email, hit.Name, hit.Dir)
+	log.Printf("panel: 删除 Qoder 网页会话账号 %s（目录 %v）", label, removed)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "removed": removed, "email": hit.Email})
+}
+
+// qoderWebDirNameOK 校验会话目录名：只允许 12 位十六进制（shortHash 的输出）。
+func qoderWebDirNameOK(name string) bool {
+	if len(name) != 12 {
+		return false
+	}
+	for _, r := range name {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 // qoderRawCookieHeader 把 qoder 域下的 Cookie 直接拼成 Cookie 头。
