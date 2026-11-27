@@ -39,6 +39,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -50,12 +51,38 @@ import (
 // qoderWebOrigin Qoder 网页控制台。
 const qoderWebOrigin = "https://qoder.com"
 
-// qoderWebAPI Qoder 开放接口（成长页就是它）。国际站与国内站不是同一套域名，
-// 支付宝扫码登录属于国内站，会话 cookie 只能打国内 openapi。
+// qoderWebOriginCN 国内站控制台（支付宝扫码登录落在这里）。
+const qoderWebOriginCN = "https://qoder.com.cn"
+
+// qoderWebAPI / qoderWebAPICN 网页会话调接口的基地址 —— **站点自己**，不是 openapi。
+//
+// ⚠️ 这里以前写的是 openapi.qoder.sh / openapi.qoder.com.cn，是「扫码成功后
+// 接口永远 401」的根因。实测（2026-11-27，容器内带真实会话）：
+//
+//	GET https://openapi.qoder.com.cn/sash/api/v1/me/campaigns
+//	→ 401 {"code":"TOKEN_INVALID","message":"missing authorization token"}
+//
+//	GET https://qoder.com.cn/sash/api/v1/me/campaigns（带 qoder_session_cookie）
+//	→ 200 {"uid":"01a2...","campaigns":[...]}
+//
+// 两套接口路径完全一样，但鉴权方式不同：openapi 只认
+// `Authorization: Bearer <token>`（客户端那条链路），网页会话的 Cookie 它一概
+// 不认 —— 所以浏览器里明明登录成功（profile 里有 qoder_session_cookie），
+// 面板打接口却一路 401，最后还要用户「重新扫码」。
+//
+// 网页端自己也不直连 openapi：成长页 iframe 的 fetch 甚至写着 credentials:"omit"，
+// 请求由 qoder.com.cn 的同源代理转发，代理才读 Cookie（无 Cookie 时报
+// "missing cookie header"）。因此网页会话必须打站点起源，路径仍是 /sash/api/...
 const (
-	qoderWebAPI   = "https://openapi.qoder.sh"
-	qoderWebAPICN = "https://openapi.qoder.com.cn"
+	qoderWebAPI   = qoderWebOrigin
+	qoderWebAPICN = qoderWebOriginCN
 )
+
+// qoderWebMePath 站点同源代理下的账号信息接口。
+//
+// /sash/api/v1/me 在代理下是 404；真正带身份的是站点自己的 /api/v1/me
+// （返回 id / name / email）。身份识别用它，别再用 /sash 那条路径。
+const qoderWebMePath = "/api/v1/me"
 
 // qoderWebSignInURL 国内版 Qoder 自己的登录页。
 //
@@ -389,6 +416,10 @@ func (p *Panel) qoderWebPoll(w http.ResponseWriter, r *http.Request) {
 		st.unauth++
 		n := st.unauth
 		qoderWebSessions.mu.Unlock()
+		// 401 的现场只有这一次能抓到（浏览器随后就被关掉），把 Cookie 名字与
+		// 响应体留在日志里，下次再出问题不必让用户重扫一遍才知道差什么。
+		log.Printf("panel: Qoder 活动接口 HTTP %d（当前页 %s，cookie=%v）：%s",
+			status, firstNonEmpty(pageURL, "未知"), qoderCookieNames(all), qoderBodySnippet(body))
 		// 会话 Cookie 刚写入、接口还没认的情况很常见，给几轮缓冲。
 		if n < 5 {
 			writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": "已登录，等待会话生效…"})
@@ -465,7 +496,11 @@ func (p *Panel) qoderWebPoll(w http.ResponseWriter, r *http.Request) {
 		ok = true
 		msg = fmt.Sprintf("今天已领取（+%.0f Credits）", amount)
 	default:
-		msg = "这个号今天服务端没有下发可领的每日额度（可能是同一个人的另一个账号已经领走了那一份）"
+		// 200 就说明会话是好的、账号已经拿到 —— 只是今天这个号没有可领的额度。
+		// 这里以前把 ok 留成 false，前端就把「账号已添加」渲染成红字失败，
+		// 用户看到的是「账号仍然没添加成功」，其实早就加进去了。
+		ok = true
+		msg = "登录成功，账号已添加；今天服务端没有可领的每日额度（可能已经领过，或同一人的另一个号已领走）"
 	}
 
 	// 会话存进该账号的 profile 目录（cookies.json）：之后每天后台直接用，
@@ -759,7 +794,7 @@ func listQoderWebSessions(root string) []qoderWebMeta {
 // 完成后反查：先问接口（最准），再退到页面存储里找邮箱/uid。
 // 两者都拿不到时返回空值 —— 调用方仍会保存会话，只是界面标注「未识别」。
 func qoderWebIdentity(port int, apiBase string, jar *cookiejar.Jar, all []cdpCookie) (email, name, uid string) {
-	for _, p := range []string{"/sash/api/v1/me", "/sash/api/v1/user/me", "/sash/api/v1/users/me"} {
+	for _, p := range []string{qoderWebMePath, "/sash/api/v1/me"} {
 		st, body, err := qoderWebGet(apiBase, jar, p)
 		if err != nil || st != http.StatusOK {
 			continue
@@ -774,7 +809,7 @@ func qoderWebIdentity(port int, apiBase string, jar *cookiejar.Jar, all []cdpCoo
 		}
 	}
 	if hdr := qoderRawCookieHeader(all, apiBase); hdr != "" {
-		for _, p := range []string{"/sash/api/v1/me", "/sash/api/v1/user/me"} {
+		for _, p := range []string{qoderWebMePath, "/sash/api/v1/me"} {
 			st, body, err := qoderWebGetRaw(apiBase, hdr, p)
 			if err != nil || st != http.StatusOK {
 				continue
@@ -825,7 +860,16 @@ func pickQoderIdentity(m map[string]any) (email, name, uid string) {
 							email = s
 						}
 					case "name", "nickname", "displayname", "username":
-						if name == "" && s != "" && !strings.Contains(s, "@") {
+						// 站点 /api/v1/me 的 name 有时就是邮箱（实测 zonbar@163.com），
+						// email 字段反而是空的 —— 这种当邮箱收，别当昵称丢掉。
+						if s == "" {
+							continue
+						}
+						if strings.Contains(s, "@") {
+							if email == "" {
+								email = s
+							}
+						} else if name == "" {
 							name = s
 						}
 					case "uid", "userid", "id":
@@ -1024,6 +1068,31 @@ func qoderRawCookieHeader(all []cdpCookie, target string) string {
 	return strings.Join(parts, "; ")
 }
 
+// qoderCookieNames 列出 qoder 域下的 Cookie 名字（只用于日志，不含值）。
+func qoderCookieNames(all []cdpCookie) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, c := range all {
+		d := strings.ToLower(c.Domain)
+		if !strings.Contains(d, "qoder") || c.Name == "" || seen[c.Name] {
+			continue
+		}
+		seen[c.Name] = true
+		out = append(out, c.Name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// qoderBodySnippet 把响应体压成一行短串（日志用）。
+func qoderBodySnippet(body []byte) string {
+	s := strings.Join(strings.Fields(string(body)), " ")
+	if len(s) > 220 {
+		s = s[:220] + "…"
+	}
+	return s
+}
+
 // qoderWebGetRaw 用显式 Cookie 头发一次 GET（不走 cookiejar）。
 func qoderWebGetRaw(base, cookieHeader, path string) (int, []byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -1141,7 +1210,7 @@ func qoderCookieJar(all []cdpCookie) (*cookiejar.Jar, []string) {
 	return jar, doms
 }
 
-// qoderWebGet / qoderWebPost 用网页会话调 openapi（CookieJar 自动按域挑 cookie）。
+// qoderWebGet / qoderWebPost 用网页会话调站点同源接口（CookieJar 自动按域挑 cookie）。
 func qoderWebGet(base string, jar *cookiejar.Jar, path string) (int, []byte, error) {
 	return qoderWebDo(base, jar, http.MethodGet, path, nil)
 }

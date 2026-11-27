@@ -37,6 +37,45 @@ func TestQoderWebAPIBaseMatchesLoginMode(t *testing.T) {
 	}
 }
 
+// TestQoderWebAPIUsesSiteOrigin 锁住「网页会话打站点起源，不打 openapi」。
+//
+// 2026-11-27 容器内实测（带真实 qoder_session_cookie）：
+//
+//	openapi.qoder.com.cn/sash/api/v1/me/campaigns → 401 TOKEN_INVALID
+//	  （它只认 Authorization: Bearer，网页的 Cookie 一概不认）
+//	qoder.com.cn/sash/api/v1/me/campaigns          → 200 {"uid":..., "campaigns":[...]}
+//
+// 用错域名就是「扫码成功、接口永远 401、让用户重扫一遍」的死循环。
+func TestQoderWebAPIUsesSiteOrigin(t *testing.T) {
+	for _, base := range []string{qoderWebAPI, qoderWebAPICN} {
+		if strings.Contains(base, "openapi") {
+			t.Errorf("网页会话的接口基地址不能是 openapi（Bearer 专用），实际 %q", base)
+		}
+		if !strings.HasPrefix(base, "https://qoder.") {
+			t.Errorf("接口基地址应是站点起源，实际 %q", base)
+		}
+	}
+	if qoderWebAPICN != qoderWebOriginCN {
+		t.Errorf("国内站接口基地址 = %q, want %q", qoderWebAPICN, qoderWebOriginCN)
+	}
+	if qoderWebMePath != "/api/v1/me" {
+		t.Errorf("账号信息接口 = %q, want /api/v1/me（/sash/api/v1/me 在站点代理下是 404）", qoderWebMePath)
+	}
+}
+
+// TestQoderCookieNamesForDiagnostics 保证 401 现场日志里能看出「带没带会话」。
+func TestQoderCookieNamesForDiagnostics(t *testing.T) {
+	all := []cdpCookie{
+		{Domain: ".qoder.com.cn", Name: "qoder_session_cookie", Value: "x"},
+		{Domain: "qoder.com.cn", Name: "qoder_visitor_id", Value: "y"},
+		{Domain: ".aliyun.com", Name: "tfstk", Value: "z"},
+	}
+	got := strings.Join(qoderCookieNames(all), ",")
+	if got != "qoder_session_cookie,qoder_visitor_id" {
+		t.Errorf("qoderCookieNames = %q", got)
+	}
+}
+
 func TestBrowserQRPrepareJSHandlesAliyunSSO(t *testing.T) {
 	if !strings.Contains(browserQRPrepareJS, "account.aliyun.com/sso/login.htm") {
 		t.Fatal("prepare JS should handle Alibaba Cloud SSO page")
