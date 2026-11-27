@@ -6,6 +6,10 @@ let view = 'checkin';   // 账号池视图已移除（2026-10-24）：签到池�
 let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null, wbQrMode = false;
 let browserQrTimer = null, browserQrPlatform = '', browserQrEmail = '', browserQrShotBusy = false;
+// browserQrDone：本轮扫码已结束（成功/失败/超时）。结束那一刻可能还有一次
+// 截图请求在路上，它返回时浏览器已关、截图必然失败 —— 不挡住的话会把
+// 「登录成功」覆盖成「等待登录页渲染二维码…」，用户看到的就是「成功了却还在等」。
+let browserQrDone = false;
 let traeLoginState = null, traeTimer = null;   // Trae 授权登录（与 WorkBuddy 那套分开）
 let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
@@ -1514,7 +1518,7 @@ function stopBrowserQrPoll() {
 }
 function resetBrowserQr() {
   stopBrowserQrPoll();
-  browserQrPlatform = ''; browserQrEmail = '';
+  browserQrPlatform = ''; browserQrEmail = ''; browserQrDone = false;
   const box = $('addBrowserQr'), img = $('browserQrImg'), st = $('browserQrState');
   if (box) box.hidden = true;
   if (img) { img.hidden = true; img.removeAttribute('src'); }
@@ -1529,14 +1533,18 @@ function browserQrStatus(text, isErr) {
 async function refreshBrowserQrShot() {
   // 后端要逐个候选框截图校验，单次请求可能比轮询间隔长；这里串行化，
   // 避免多个请求同时压到同一个 CDP 端口上互相干扰。
-  if (!browserQrPlatform || browserQrShotBusy) return;
+  if (!browserQrPlatform || browserQrShotBusy || browserQrDone) return;
   browserQrShotBusy = true;
   const img = $('browserQrImg');
+  const platformAtStart = browserQrPlatform;
   const qs = 'platform=' + encodeURIComponent(browserQrPlatform) +
     (browserQrEmail ? '&email=' + encodeURIComponent(browserQrEmail) : '') +
     '&t=' + Date.now();
   try {
     const r = await api('browser/qr?' + qs, { cache: 'no-store' });
+    // 请求发出后本轮可能已经结束（或已切到别的平台）：此时任何结果都过期了，
+    // 拿去写界面只会把「登录成功」覆盖成「等待渲染」。
+    if (browserQrDone || browserQrPlatform !== platformAtStart) return;
     const statusText = {
       new: '请用手机 App 扫描下方二维码',
       authorizing: '已扫描，请在手机上确认授权',
@@ -1548,6 +1556,8 @@ async function refreshBrowserQrShot() {
     if (r.qr && img) { img.src = r.qr; img.hidden = false; browserQrStatus(msg); }
     else { if (img) { img.hidden = true; img.removeAttribute('src'); } browserQrStatus('等待登录页渲染二维码…'); }
   } catch (e) {
+    // 本轮已结束 / 已切平台：这次失败属于「过期请求」，不要动界面。
+    if (browserQrDone || browserQrPlatform !== platformAtStart) return;
     // 二维码未渲染时后端返回错误：清掉上一轮可能截错的图，统一显示等待态，
     // 不把内部错误详情（含 URL）暴露给用户，下一轮轮询会继续重试。
     if (img) { img.hidden = true; img.removeAttribute('src'); }
@@ -1559,24 +1569,31 @@ async function refreshBrowserQrShot() {
 async function pollBrowserQrShot() {
   const flow = browserQrFlows[browserQrPlatform];
   if (!flow) return;
+  const platformAtStart = browserQrPlatform;
   const suffix = flow === browserQrFlows.qoder
     ? '?email=' + encodeURIComponent(browserQrEmail) : '';
   try {
     const r = await api(flow.poll + suffix);
+    // 请求发出后已切平台 / 已结束：这轮结果作废，别再改界面。
+    if (browserQrDone || browserQrPlatform !== platformAtStart) return;
     if (r.done) {
+      browserQrDone = true;   // 先立标志，挡住还在路上的截图回调
       stopBrowserQrPoll();
       const okAll = r.ok !== false;
       browserQrStatus(r.message || (okAll ? '登录成功' : '登录未完成'), !okAll);
-      if (!okAll) {
-        // 失败时把二维码撤掉，否则残留的图会让人以为「还在等扫码」。
-        const im = $('browserQrImg');
-        if (im) { im.hidden = true; im.removeAttribute('src'); }
-      }
+      const im = $('browserQrImg');
+      // 无论成败都撤掉二维码：成功后还摆着一张已失效的码，用户会以为要再扫一次。
+      if (im) { im.hidden = true; im.removeAttribute('src'); }
       loadOverview(true);
       if (typeof reloadCurrentView === 'function') reloadCurrentView(true);
       return;
     }
-    if (r.expired || r.fatal) { stopBrowserQrPoll(); browserQrStatus(r.message || '登录已结束', true); return; }
+    if (r.expired || r.fatal) {
+      browserQrDone = true;
+      stopBrowserQrPoll();
+      browserQrStatus(r.message || '登录已结束', true);
+      return;
+    }
     if (r.message) browserQrStatus(r.message);
   } catch (e) {
     // 浏览器刚启动、CDP 还没就绪时会短暂报错，下一轮继续。

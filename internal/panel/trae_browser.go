@@ -24,8 +24,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
@@ -108,6 +111,19 @@ func headlessBrowserArgs(args []string) []string {
 	return append(headless, args...)
 }
 
+// chromiumNoSandboxArgs 容器 / 无桌面环境的 Chromium 沙箱开关。
+//
+// 容器里没有可用的 user namespace，Chromium 会因 "No usable sandbox!" 直接退出：
+// 进程确实被拉起来了（exec.Start 成功），但从不监听调试端口，上层看到的就是
+// 「浏览器调试端口未就绪」——豆包签到、Trae 续期、CodeArts 补采都栽在这。
+// 桌面端（localClientEnabled）保持沙箱不变。
+func chromiumNoSandboxArgs() []string {
+	if localClientEnabled() {
+		return nil
+	}
+	return []string{"--no-sandbox", "--disable-dev-shm-usage"}
+}
+
 // browserPortsReserved 记录进程内刚分配出去的调试端口及时间。
 //
 // 为什么需要：freePort 靠 bind 检测端口空闲，但 exec.Command.Start() 只是拉起
@@ -133,6 +149,62 @@ func freePort(ports []int) (int, error) {
 		}
 	}
 	return 0, fmt.Errorf("9333-9433 无可用调试端口")
+}
+
+// clearStaleChromiumSingleton 清理 profile 里指向「已死进程」的 Chromium 单例锁，
+// 返回是否真的清过。
+//
+// 为什么必须有：浏览器被 Kill（或容器重启）后，profile 里会留下
+//   SingletonLock   -> <hostname>-<pid>
+//   SingletonCookie -> 一串数字
+//   SingletonSocket -> /tmp/.org.chromium.Chromium.XXXX/SingletonSocket
+// 复用同一个 profile 再启动时，Chromium 认为已有实例在跑：把地址转给那个**不存在**
+// 的实例，然后自己静默退出 —— 新进程不监听调试端口，面板侧表现就是永远
+// 「等待浏览器就绪…」，二维码也出不来。
+//
+// 影响面：Trae「添加账号」每次新建 pending-<时间戳> 不受影响；Qoder 网页登录
+// （按邮箱哈希固定目录）和 Trae 的 acc-<uid> 续期会话必踩。
+//
+// 保守判断：Lock 不是符号链接（Windows 的普通文件形态）就完全不碰；链接目标的
+// pid 还活着也不碰。只有确认目标已消失才删。
+func clearStaleChromiumSingleton(dir string) bool {
+	lockPath := filepath.Join(dir, "SingletonLock")
+	fi, err := os.Lstat(lockPath)
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		return false
+	}
+	target, err := os.Readlink(lockPath)
+	if err != nil {
+		return false
+	}
+	// 形如 "deee4c32dff2-320"：主机名里可能有 '-'，所以取最后一个 '-' 之后。
+	if i := strings.LastIndex(target, "-"); i >= 0 && processAlive(target[i+1:]) {
+		return false // 主实例还活着，别动
+	}
+	removed := false
+	for _, name := range []string{"SingletonLock", "SingletonCookie", "SingletonSocket"} {
+		if err := os.Remove(filepath.Join(dir, name)); err == nil {
+			removed = true
+		}
+	}
+	return removed
+}
+
+// processAlive 判断 pid 对应的进程是否还存在。
+func processAlive(pidStr string) bool {
+	pid, err := strconv.Atoi(strings.TrimSpace(pidStr))
+	if err != nil || pid <= 0 {
+		return false
+	}
+	if runtime.GOOS == "linux" {
+		_, serr := os.Stat(filepath.Join("/proc", strconv.Itoa(pid)))
+		return serr == nil
+	}
+	p, perr := os.FindProcess(pid)
+	if perr != nil {
+		return false
+	}
+	return p.Signal(syscall.Signal(0)) == nil
 }
 
 // traeBrowserBaseDir 浏览器 profile 的根目录：config.json 所在目录下的 data/。
@@ -531,6 +603,10 @@ func traeBrowserRefresh(dir string) (string, error) {
 	if abs, err := filepath.Abs(dir); err == nil {
 		dir = abs
 	}
+	// acc-<uid> 是长期复用的 profile：残留单例锁会导致新实例静默退出。
+	if clearStaleChromiumSingleton(dir) {
+		log.Printf("panel: Trae 续期清理残留的浏览器单例锁 %s", filepath.Base(dir))
+	}
 	chrome, err := findChrome()
 	if err != nil {
 		return "", err
@@ -539,13 +615,14 @@ func traeBrowserRefresh(dir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	cmd := exec.Command(chrome,
+	args := []string{
 		"--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
 		"--disable-extensions",
 		fmt.Sprintf("--remote-debugging-port=%d", port),
-		"--user-data-dir="+dir,
+		"--user-data-dir=" + dir,
 		"https://www.trae.cn/",
-	)
+	}
+	cmd := exec.Command(chrome, append(args, chromiumNoSandboxArgs()...)...)
 	if err := cmd.Start(); err != nil {
 		return "", fmt.Errorf("启动无头浏览器失败: %w", err)
 	}

@@ -363,13 +363,16 @@ func doubaoRunInBrowser(cookies map[string]string, doClick bool, baseDir string)
 	// 同时挑中同一个端口，后启动的 Chrome 绑不上就整个失败。这里锁住「选端口 →
 	// 启动 → 等 Chrome 真正绑定调试端口」这一小段，之后的流程各会话完全并行。
 	doubaoPortMu.Lock()
-	cmd := exec.Command(chrome,
+	args := []string{
 		"--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
 		"--disable-extensions", "--window-size=1280,900",
 		fmt.Sprintf("--remote-debugging-port=%d", port),
-		"--user-data-dir="+dir,
+		"--user-data-dir=" + dir,
 		"about:blank",
-	)
+	}
+	// 容器里没有可用沙箱，缺这两个参数 Chromium 会静默退出（端口永远不监听）。
+	args = append(args, chromiumNoSandboxArgs()...)
+	cmd := exec.Command(chrome, args...)
 	if err := cmd.Start(); err != nil {
 		doubaoPortMu.Unlock()
 		return "error", "启动无头浏览器失败: " + err.Error(), ""

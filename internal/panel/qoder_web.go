@@ -183,6 +183,12 @@ func (p *Panel) qoderWebStart(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "创建浏览器 profile 目录失败: "+err.Error())
 		return
 	}
+	// 这个 profile 是按邮箱固定复用的：上一次浏览器被 Kill 后留下的 SingletonLock
+	// 会让新实例「转给不存在的旧实例然后静默退出」，表现为 CDP 端口一直不监听、
+	// 前端永远「等待浏览器就绪…」。启动前清掉失效锁。
+	if clearStaleChromiumSingleton(dir) {
+		log.Printf("panel: Qoder 清理残留的浏览器单例锁 %s", filepath.Base(dir))
+	}
 	// 扫码登录走国内版阿里云 SSO（支付宝扫码入口）；普通网页登录仍走国际站。
 	loginURL := qoderWebOrigin + "/account/usage"
 	if req.SSO {

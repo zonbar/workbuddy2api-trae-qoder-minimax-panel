@@ -1238,7 +1238,8 @@ func launchChromeHeadless(chrome string, port int, dir string) (func(), error) {
 // 9333-9341 调试端口还吃内存 —— 实测漏了 97 个进程，最后把网关自己挤挂了。
 // 注意清理函数不碰 profile 目录：那是账号的设备身份，归槽生命周期管。
 func launchChromeWithArgs(chrome string, args []string) (func(), error) {
-	cmd := exec.Command(chrome, args...)
+	// 容器里没有可用沙箱：缺 --no-sandbox 时 Chromium 起得来但不监听调试端口。
+	cmd := exec.Command(chrome, append(args, chromiumNoSandboxArgs()...)...)
 	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
 	if err := cmd.Start(); err != nil {
 		return nil, err
