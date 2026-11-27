@@ -1558,9 +1558,18 @@ async function refreshBrowserQrShot() {
   } catch (e) {
     // 本轮已结束 / 已切平台：这次失败属于「过期请求」，不要动界面。
     if (browserQrDone || browserQrPlatform !== platformAtStart) return;
+    if (img) { img.hidden = true; img.removeAttribute('src'); }
+    // 「浏览器已退出 / 尚未启动」是要用户动手的，必须如实显示：统一显示
+    // 「等待渲染」会让人一直干等，而二维码永远不会再出现。
+    const fatal = /请重新|尚未启动|已退出/.test(e.message || '');
+    if (fatal) {
+      browserQrDone = true;
+      stopBrowserQrPoll();
+      browserQrStatus(e.message, true);
+      return;
+    }
     // 二维码未渲染时后端返回错误：清掉上一轮可能截错的图，统一显示等待态，
     // 不把内部错误详情（含 URL）暴露给用户，下一轮轮询会继续重试。
-    if (img) { img.hidden = true; img.removeAttribute('src'); }
     browserQrStatus('等待登录页渲染二维码…');
   } finally {
     browserQrShotBusy = false;

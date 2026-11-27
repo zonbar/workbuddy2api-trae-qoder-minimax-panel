@@ -13,8 +13,10 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	_ "image/png" // 注册 PNG decoder，供 image.Decode 识别二维码截图
+	"image/png" // 既要解码截图，也要把裁剪后的图重新编码
 	"net/http"
+	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -120,12 +122,39 @@ const browserQRDismissJS = `(() => {
   return n;
 })()`
 
-var browserQRPrepared sync.Map // key=port:platform → time.Time
+// preparedQR 记录「这个调试端口上的登录页已经点过入口」，避免轮询时反复点。
+//
+// 必须连页面 URL 一起记：调试端口是复用的（freePort 分配完回收，下一次很容易
+// 又给到同一个号），只看 port:platform 会让新拉起的浏览器继承上一次的「已准备」
+// 标记 —— 于是不再点「支付宝」入口，页面停在 SSO 首页，二维码永远不出来。
+// 这正是「第一次能拿到图，第二次拿不到」的成因之一。
+type preparedQR struct {
+	at  time.Time
+	url string
+}
 
-func browserQRPrepareOnce(port int, platform string, ws *wsConn) {
+var browserQRPrepared sync.Map // key=port:platform → preparedQR
+
+// browserQRForget 在浏览器重新拉起时清掉该端口的准备标记。
+func browserQRForget(port int, platform string) {
+	browserQRPrepared.Delete(fmt.Sprintf("%d:%s", port, platform))
+}
+
+// qrURLKey 取 URL 的 scheme://host/path（忽略 query）：
+// SSO 链接每次的 nonce/state 都不同，带 query 比较会让「同一页面」永远不相等。
+func qrURLKey(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	return u.Scheme + "://" + u.Host + u.Path
+}
+
+func browserQRPrepareOnce(port int, platform string, ws *wsConn, pageURL string) {
 	key := fmt.Sprintf("%d:%s", port, platform)
 	if last, ok := browserQRPrepared.Load(key); ok {
-		if time.Since(last.(time.Time)) < 5*time.Minute {
+		st := last.(preparedQR)
+		if time.Since(st.at) < 5*time.Minute && qrURLKey(st.url) == qrURLKey(pageURL) {
 			return
 		}
 	}
@@ -134,7 +163,7 @@ func browserQRPrepareOnce(port int, platform string, ws *wsConn) {
 	raw, err := caEval(ws, browserQRPrepareJS)
 	var clicked bool
 	if err == nil && json.Unmarshal(raw, &clicked) == nil && clicked {
-		browserQRPrepared.Store(key, time.Now())
+		browserQRPrepared.Store(key, preparedQR{at: time.Now(), url: pageURL})
 	}
 }
 
@@ -176,7 +205,12 @@ func (p *Panel) browserQRPort(platform, email string) (int, error) {
 		qoderWebSessions.mu.Lock()
 		defer qoderWebSessions.mu.Unlock()
 		if st := qoderWebSessions.by[email]; st != nil && st.port > 0 && st.proc != nil && !st.done {
-			return st.port, nil
+			// 进程已被回收时端口一定不会再监听，直接报「需要重新发起」，
+			// 比让前端一直等「二维码尚未渲染」有用得多。
+			if qoderWebProcAlive(st.proc) {
+				return st.port, nil
+			}
+			return 0, fmt.Errorf("登录浏览器已退出，请重新点「扫码登录（支付宝）」")
 		}
 	default:
 		return 0, fmt.Errorf("unknown platform %q", platform)
@@ -393,6 +427,184 @@ func qrShotLooksLikeQR(png []byte) bool {
 		flipRate >= 0.06
 }
 
+// trimQRShot 把截图裁到二维码本体，返回重新编码的 PNG。
+//
+// 为什么需要：DOM 里的「二维码元素」常常是一个大卡片——上面有标题、右边有操作说明、
+// 底部有「打开 App 扫码」提示（支付宝 / 阿里云 SSO 页面就是这样）。按元素框整块
+// 截图虽然能通过内容校验（二维码够大），但用户看到的是「一张大图中间一个小码」，
+// 在弹窗里被压缩后几乎扫不动。
+//
+// 做法是先做行列投影，而不是简单的暗像素包围盒：卡片标题、说明文字也是暗像素，
+// 包围盒会被文字撑大。二维码的特征是**整行/整列都密集分布暗像素**（模块占 30%~50%），
+// 文字行只有零星几个暗像素。所以：
+//
+//  1. 二值化后算每行的暗像素占比，取连续「≥0.18」的最长行区间 → 纵向范围；
+//  2. 在该纵向范围内算每列占比，取连续「≥0.18」的最长列区间 → 横向范围；
+//  3. 按 8% 留白（二维码静区）裁剪，比例异常时原样返回。
+func trimQRShot(raw []byte) []byte {
+	src, _, err := image.Decode(bytes.NewReader(raw))
+	if err != nil {
+		return raw
+	}
+	b := src.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if w < 60 || h < 60 {
+		return raw
+	}
+	dark := make([]bool, w*h)
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			g := color.GrayModel.Convert(src.At(b.Min.X+x, b.Min.Y+y)).(color.Gray).Y
+			dark[y*w+x] = g < 110
+		}
+	}
+	// 以「暗像素密度最高的那一行/列」为种子向两侧扩展，遇到连续空白带就断开。
+	//
+	// 为什么不用固定密度阈值：二维码在截图里可能只占整宽的 1/3，一行模块的暗像素
+	// 占比本来就只有 0.1~0.2，卡阈值要么漏掉模块行、要么把标题文字一起收进来
+	// （实测行密度在 0.21 上下波动，任何单点阈值都会把二维码切成几段）。
+	// 从峰值行出发找「空白分隔带」则与绝对密度无关：卡片标题与二维码之间一定有
+	// 一段空白，标题和说明文字自然被排除在外。
+	extend := func(n int, rate func(int) float64, seed int, minGap int) (int, int) {
+		const empty = 0.03
+		lo, hi := seed, seed
+		gap := 0
+		for i := seed - 1; i >= 0; i-- {
+			if rate(i) < empty {
+				gap++
+				if gap >= minGap {
+					break
+				}
+				continue
+			}
+			gap = 0
+			lo = i
+		}
+		gap = 0
+		for i := seed + 1; i < n; i++ {
+			if rate(i) < empty {
+				gap++
+				if gap >= minGap {
+					break
+				}
+				continue
+			}
+			gap = 0
+			hi = i
+		}
+		return lo, hi + 1
+	}
+	peak := func(n int, rate func(int) float64, hint int) int {
+		// 种子不能取「密度最高的行」：卡片标题是一行实心文字，整行密度常常比
+		// 只占 1/3 宽度的二维码模块行还高（实测 0.26 vs 0.21），会从标题开始裁。
+		// 二维码的暗像素总量远多于文字，所以用暗像素质心当提示，取离它最近的
+		// 「有内容」行 / 列 —— 质心几乎必然落在二维码内部。
+		const content = 0.05
+		best, bestD := -1, 1<<30
+		for i := 0; i < n; i++ {
+			if rate(i) < content {
+				continue
+			}
+			d := i - hint
+			if d < 0 {
+				d = -d
+			}
+			if d < bestD {
+				best, bestD = i, d
+			}
+		}
+		if best < 0 {
+			return hint
+		}
+		return best
+	}
+	// 暗像素质心（同时用于行列种子）。
+	var sumX, sumY float64
+	darkCount := 0
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			if dark[y*w+x] {
+				sumX += float64(x)
+				sumY += float64(y)
+				darkCount++
+			}
+		}
+	}
+	if darkCount < 200 {
+		return raw
+	}
+	hintY, hintX := int(sumY/float64(darkCount)), int(sumX/float64(darkCount))
+	rowRate := func(y int) float64 {
+		n := 0
+		for x := 0; x < w; x++ {
+			if dark[y*w+x] {
+				n++
+			}
+		}
+		return float64(n) / float64(w)
+	}
+	minGap := h / 60
+	if minGap < 5 {
+		minGap = 5
+	}
+	y0, y1 := extend(h, rowRate, peak(h, rowRate, hintY), minGap)
+	if y1-y0 < 60 {
+		return raw
+	}
+	colRate := func(x int) float64 {
+		n := 0
+		for y := y0; y < y1; y++ {
+			if dark[y*w+x] {
+				n++
+			}
+		}
+		return float64(n) / float64(y1-y0)
+	}
+	x0, x1 := extend(w, colRate, peak(w, colRate, hintX), minGap)
+	if x1-x0 < 60 {
+		return raw
+	}
+	bw, bh := x1-x0, y1-y0
+	// 二维码基本正方形；比例离谱说明投影抓到了别的竖条（侧边栏、分隔线），不裁。
+	ratio := float64(bw) / float64(bh)
+	if ratio < 0.72 || ratio > 1.4 {
+		return raw
+	}
+	pad := int(float64(bw+bh) / 2 * 0.08)
+	if pad < 4 {
+		pad = 4
+	}
+	x0, y0 = x0-pad, y0-pad
+	x1, y1 = x1+pad, y1+pad
+	if x0 < 0 {
+		x0 = 0
+	}
+	if y0 < 0 {
+		y0 = 0
+	}
+	if x1 > w {
+		x1 = w
+	}
+	if y1 > h {
+		y1 = h
+	}
+	// 只裁掉了一圈边才值得重新编码，否则保持原图（避免无谓的画质损失）。
+	if (x1-x0)*(y1-y0) > w*h*85/100 {
+		return raw
+	}
+	out := image.NewRGBA(image.Rect(0, 0, x1-x0, y1-y0))
+	for y := y0; y < y1; y++ {
+		for x := x0; x < x1; x++ {
+			out.Set(x-x0, y-y0, src.At(b.Min.X+x, b.Min.Y+y))
+		}
+	}
+	var buf bytes.Buffer
+	if png.Encode(&buf, out) != nil {
+		return raw
+	}
+	return buf.Bytes()
+}
+
 func cdpQRScreenshot(port int, platform string) (string, error) {
 	ws, pageURL, err := cdpQRPickPage(port, platform)
 	if err != nil {
@@ -400,7 +612,7 @@ func cdpQRScreenshot(port int, platform string) (string, error) {
 	}
 	defer ws.Close()
 
-	browserQRPrepareOnce(port, platform, ws)
+	browserQRPrepareOnce(port, platform, ws, pageURL)
 	// 二维码由登录页 JS 异步渲染：点完入口 / 页面刚打开时元素还没画出来，
 	// 而且页面里常并存同尺寸的装饰插画（豆包礼盒）和空白占位框。
 	// 所以每一轮都要「取多个候选框 → 逐个截图 → 校验图像内容」，只有真二维码
@@ -420,6 +632,11 @@ func cdpQRScreenshot(port int, platform string) (string, error) {
 				}
 			}
 		}
+		// 小框优先：同一个登录页里，二维码本体的框永远比「包着它的卡片」小，
+		// 先试小框能少截一层装饰，返回给用户的图也更紧凑。
+		sort.SliceStable(boxes, func(i, j int) bool {
+			return boxes[i].Width*boxes[i].Height < boxes[j].Width*boxes[j].Height
+		})
 		for _, box := range boxes {
 			if box.Width < 100 || box.Height < 100 {
 				continue
@@ -442,7 +659,9 @@ func cdpQRScreenshot(port int, platform string) (string, error) {
 				continue
 			}
 			if decoded, derr := base64.StdEncoding.DecodeString(shot.Data); derr == nil && qrShotLooksLikeQR(decoded) {
-				return "data:image/png;base64," + shot.Data, nil
+				// 校验通过后再裁边：先保证「是二维码」，再把卡片留白/标题裁掉，
+				// 拿到的是「只有二维码」的紧凑图。
+				return "data:image/png;base64," + base64.StdEncoding.EncodeToString(trimQRShot(decoded)), nil
 			}
 		}
 		if attempt < maxAttempts-1 {

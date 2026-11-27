@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"image"
 	"image/color"
+	"image/draw"
 	"image/png"
 	"net/url"
 	"strconv"
@@ -151,5 +152,97 @@ func TestQRShotLooksLikeQR(t *testing.T) {
 	}
 	if qrShotLooksLikeQR(nil) {
 		t.Error("nil image should NOT pass the QR check")
+	}
+}
+
+// TestTrimQRShotKeepsOnlyCode 保证「卡片式二维码」截图被裁到二维码本体：
+// 支付宝 / 阿里云 SSO 页面把二维码放在带标题和说明文字的大卡片里，整块发给
+// 用户会变成「一张大图中间一个小码」，在弹窗里被压到看不清。
+func TestTrimQRShotKeepsOnlyCode(t *testing.T) {
+	code, err := qrcode.New("https://qoder.com/sso/probe-token", qrcode.Medium)
+	if err != nil {
+		t.Fatalf("build qrcode: %v", err)
+	}
+	const (
+		cw, ch = 480, 420
+		size   = 180
+		ox, oy = 150, 150
+	)
+	canvas := image.NewRGBA(image.Rect(0, 0, cw, ch))
+	draw.Draw(canvas, canvas.Bounds(), &image.Uniform{C: color.White}, image.Point{}, draw.Src)
+	// 卡片标题：若干黑块，模拟「用支付宝扫码登录」这类文字行。
+	for i := 0; i < 7; i++ {
+		x := 40 + i*26
+		for y := 40; y < 58; y++ {
+			for xx := x; xx < x+18; xx++ {
+				canvas.Set(xx, y, color.Black)
+			}
+		}
+	}
+	src := code.Image(size)
+	draw.Draw(canvas, image.Rect(ox, oy, ox+size, oy+size), src, src.Bounds().Min, draw.Src)
+
+	raw := encodeTestPNG(t, canvas)
+	out := trimQRShot(raw)
+	img, _, err := image.Decode(bytes.NewReader(out))
+	if err != nil {
+		t.Fatalf("decode trimmed: %v", err)
+	}
+	b := img.Bounds()
+	// 原图 480×420；裁完应该贴着 180 的二维码（含静区与 8% 留白）。
+	if b.Dx() >= cw || b.Dy() >= ch {
+		t.Fatalf("未裁剪：%dx%d", b.Dx(), b.Dy())
+	}
+	if b.Dx() < 140 || b.Dy() < 140 || b.Dx() > 260 || b.Dy() > 260 {
+		t.Fatalf("裁剪结果尺寸异常：%dx%d，期望接近 %d 见方", b.Dx(), b.Dy(), size)
+	}
+	// 裁完必须仍然是二维码（不能把本体裁掉一块）。
+	if !qrShotLooksLikeQR(out) {
+		t.Error("裁剪后应仍能通过二维码内容校验")
+	}
+	// 纯色图不该被改动（没有可裁的内容）。
+	blank := image.NewRGBA(image.Rect(0, 0, 200, 200))
+	draw.Draw(blank, blank.Bounds(), &image.Uniform{C: color.White}, image.Point{}, draw.Src)
+	if got := trimQRShot(encodeTestPNG(t, blank)); !bytes.Equal(got, encodeTestPNG(t, blank)) {
+		t.Error("纯色图不应被裁剪")
+	}
+}
+
+// TestQoderRawCookieHeaderCoversHostOnly 保证 401 兜底能带上 host-only 会话 Cookie。
+// Go 的 cookiejar 严格按标准只把 host-only Cookie 发给设置它的主机，可浏览器发给
+// openapi 子域时是带的 —— 不补这个兜底就会出现「浏览器里登录了，接口却 401」。
+func TestQoderRawCookieHeaderCoversHostOnly(t *testing.T) {
+	all := []cdpCookie{
+		{Name: "session", Value: "abc", Domain: "qoder.com.cn", Path: "/"},
+		{Name: "dotted", Value: "d", Domain: ".qoder.com.cn", Path: "/"},
+		{Name: "intl", Value: "i", Domain: ".qoder.com", Path: "/"},
+		{Name: "ali", Value: "y", Domain: ".alipay.com", Path: "/"},
+	}
+	h := qoderRawCookieHeader(all, "https://openapi.qoder.com.cn")
+	for _, want := range []string{"session=abc", "dotted=d"} {
+		if !strings.Contains(h, want) {
+			t.Errorf("缺少 %s（host-only 也要带）: %s", want, h)
+		}
+	}
+	for _, bad := range []string{"intl=", "ali="} {
+		if strings.Contains(h, bad) {
+			t.Errorf("不该带其它域的 %s: %s", bad, h)
+		}
+	}
+	if got := qoderRawCookieHeader(nil, "https://openapi.qoder.com.cn"); got != "" {
+		t.Errorf("没有 cookie 时应返回空串，实际 %q", got)
+	}
+}
+
+// TestQRURLKeyIgnoresQuery 保证 SSO 链接每轮的 nonce/state 不影响「已准备」判定，
+// 否则轮询会反复点「支付宝」入口，把页面点得来回跳转、二维码永远出不来。
+func TestQRURLKeyIgnoresQuery(t *testing.T) {
+	a := qrURLKey("https://account.aliyun.com/sso/login.htm?nonce=1&state=aa")
+	b := qrURLKey("https://account.aliyun.com/sso/login.htm?nonce=2&state=bb")
+	if a != b {
+		t.Fatalf("同一页面的不同 query 应视为同一页：%q vs %q", a, b)
+	}
+	if qrURLKey("https://account.aliyun.com/sso/login.htm") == qrURLKey("https://account.aliyun.com/sso/other.htm") {
+		t.Fatal("不同路径不应相等")
 	}
 }

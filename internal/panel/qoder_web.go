@@ -41,6 +41,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/ideauth"
@@ -109,6 +110,9 @@ type qoderWebState struct {
 	ok        bool
 	message   string
 	sso       bool // 支付宝扫码走国内站；普通网页登录走国际站
+	// unauth 连续「已到应用页但接口 401」的次数。会话 Cookie 刚写入时接口
+	// 可能还不认，一次 401 就判死会把「其实已经登录成功」的号误杀。
+	unauth int
 }
 
 func (st *qoderWebState) apiBase() string {
@@ -154,9 +158,17 @@ func (p *Panel) qoderWebStart(w http.ResponseWriter, r *http.Request) {
 	qoderWebSessions.mu.Lock()
 	st := qoderWebSessions.by[email]
 	if st != nil && st.proc != nil && !st.done {
-		qoderWebSessions.mu.Unlock()
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "running": true, "message": "浏览器已在运行，请在窗口里登录这个 Qoder 账号"})
-		return
+		// 复用只对「刚拉起、进程还活着」的会话成立。用户再点一次扫码，多半是
+		// 因为上一次的浏览器已经跳到登录后的页面（二维码没了）或者进程已退出，
+		// 这时必须重新拉一次回到扫码页 —— 否则前端会一直「等待渲染二维码」，
+		// 表现就是「第一次能扫，第二次拿不到图」。
+		if time.Since(st.startedAt) < 90*time.Second && qoderWebProcAlive(st.proc) {
+			qoderWebSessions.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "running": true, "message": "浏览器已在运行，请用支付宝扫码登录"})
+			return
+		}
+		qoderWebClose(st)
+		log.Printf("panel: Qoder 重新拉起登录浏览器 %s（上次会话已超时或浏览器已退出）", email)
 	}
 	chrome, err := findChrome()
 	if err != nil {
@@ -206,6 +218,9 @@ func (p *Panel) qoderWebStart(w http.ResponseWriter, r *http.Request) {
 		email: email, port: port, dir: dir, proc: cmd, startedAt: time.Now(), sso: req.SSO,
 	}
 	qoderWebSessions.mu.Unlock()
+	// 端口是复用的：新浏览器必须重新点一次「支付宝」入口，否则会继承上一次
+	// 会话的「已准备」标记，页面停在 SSO 首页不出二维码。
+	browserQRForget(port, "qoder")
 	log.Printf("panel: Qoder 网页登录：%s（调试端口 %d，profile %s，代理 %s）",
 		email, port, dir, firstNonEmpty(egress.ProxyURL, "进程默认"))
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -249,6 +264,12 @@ func (p *Panel) qoderWebPoll(w http.ResponseWriter, r *http.Request) {
 	apiBase := st.apiBase()
 	qoderWebSessions.mu.Unlock()
 
+	// 扫码成功后阿里云常常还要在页面上点一次「确认登录 / 授权」。容器里的浏览器
+	// 没有窗口可点，这一步不代劳的话，登录就永远差最后一下。
+	if clicked := qoderAutoConfirm(port); clicked != "" {
+		log.Printf("panel: Qoder 自动确认授权 %q", clicked)
+	}
+
 	all, err := cdpAllCookies(port)
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": "等待浏览器就绪…"})
@@ -266,11 +287,37 @@ func (p *Panel) qoderWebPoll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": "等待浏览器就绪…"})
 		return
 	}
+	// jar 严格按标准分发 Cookie：host-only 的会话 Cookie 不会被发给 openapi
+	// 子域，但浏览器自己的 JS 请求会带上。401 时用原始 Cookie 头再试一次。
 	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		if hdr := qoderRawCookieHeader(all, apiBase); hdr != "" {
+			if s2, b2, e2 := qoderWebGetRaw(apiBase, hdr, "/sash/api/v1/me/campaigns"); e2 == nil && s2 == http.StatusOK {
+				status, body = s2, b2
+			}
+		}
+	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		// 判定前先看浏览器停在哪：还在支付宝 / 阿里云 / qoder 登录页上时，
+		// qoder 域的那点 Cookie 只是访客态，401 说明「还没登完」，不是没权限。
+		// 以前这里一次 401 就判死并关掉浏览器，正是「扫码后立刻报授权失败」的原因。
+		if onApp, pageURL := qoderBrowserOnApp(port); !onApp {
+			log.Printf("panel: Qoder 尚未完成登录（当前页 %s，HTTP %d），继续等待", firstNonEmpty(pageURL, "未知"), status)
+			writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": "等待在浏览器中完成 Qoder 登录…"})
+			return
+		}
+		qoderWebSessions.mu.Lock()
+		st.unauth++
+		n := st.unauth
+		qoderWebSessions.mu.Unlock()
+		// 会话 Cookie 刚写入、接口还没认的情况很常见，给几轮缓冲。
+		if n < 5 {
+			writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": "已登录，等待会话生效…"})
+			return
+		}
 		qoderWebSessions.mu.Lock()
 		st.done = true
 		st.ok = false
-		st.message = "这个浏览器会话拿不到 openapi 的授权（HTTP " + fmt.Sprint(status) + "）。请在窗口里确认登录的是 Qoder 账号后重试。"
+		st.message = "登录后接口仍返回 HTTP " + fmt.Sprint(status) + "（已重试 " + fmt.Sprint(n) + " 次）。请重新点一次扫码登录，用要添加的那个 Qoder 账号扫码。"
 		qoderWebClose(st)
 		qoderWebSessions.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{"done": true, "ok": false, "message": st.message})
@@ -374,6 +421,147 @@ func qoderWebClose(st *qoderWebState) {
 	}
 	_ = p.Process.Kill()
 	_, _ = p.Process.Wait()
+}
+
+// qoderWebProcAlive 判断浏览器进程是否还在跑。
+//
+// exec.Cmd 只能告诉你「启动成功」，进程随后崩溃/退出它不会自己变；而面板把
+// 「有 proc 且未 done」当成「浏览器在运行」，于是进程死了以后：扫码接口还返回
+// 旧端口（截图必然失败）、再次点扫码也复用这个死会话 —— 用户看到的就是
+// 「第一次能出图，第二次拿不到」。
+func qoderWebProcAlive(cmd *exec.Cmd) bool {
+	if cmd == nil || cmd.Process == nil {
+		return false
+	}
+	return cmd.Process.Signal(syscall.Signal(0)) == nil
+}
+
+// qoderAutoConfirmJS 扫码后自动走完阿里云的授权确认。
+//
+// 容器里的浏览器没有窗口可点，支付宝扫码成功后如果停在「确认登录 / 授权」
+// 页面，登录就永远差最后一步：qoder.com.cn 拿不到会话，接口一路 401，
+// 用户只能看到「这个浏览器会话拿不到 openapi 的授权」。这里只在阿里云域上
+// 点语义明确的确认类按钮，不做任何输入类操作。
+const qoderAutoConfirmJS = `(() => {
+  const host = location.hostname || '';
+  if (host.indexOf('aliyun') < 0) return JSON.stringify('');
+  const texts = ['确认登录', '同意并登录', '确认授权', '同意授权', '授权登录', '继续登录', '确认', '同意'];
+  for (const el of document.querySelectorAll('button,a,[role="button"],input[type="submit"],span[class*="btn" i]')) {
+    const t = ((el.textContent || el.value || '')).trim();
+    if (!t || t.length > 10) continue;
+    if (texts.indexOf(t) < 0) continue;
+    try { el.click(); return JSON.stringify(t); } catch (e) {}
+  }
+  return JSON.stringify('');
+})()`
+
+// qoderAutoConfirm 在当前页面上尝试点一次授权确认按钮，返回点到的文案。
+func qoderAutoConfirm(port int) string {
+	pages, err := caListPages(port)
+	if err != nil {
+		return ""
+	}
+	for _, pg := range pages {
+		u, err := url.Parse(pg.URL)
+		if err != nil || !strings.Contains(strings.ToLower(u.Host), "aliyun") {
+			continue
+		}
+		ws, err := wsDial(pg.WS, 6*time.Second)
+		if err != nil {
+			continue
+		}
+		raw, err := caEval(ws, qoderAutoConfirmJS)
+		ws.Close()
+		if err != nil {
+			continue
+		}
+		var clicked string
+		if json.Unmarshal(raw, &clicked) == nil && clicked != "" {
+			return clicked
+		}
+	}
+	return ""
+}
+
+// qoderBrowserOnApp 判断浏览器是否已经停在 Qoder 的应用页面（登录页 / SSO 之外）。
+//
+// 这是 401 的唯一可信上下文：还在支付宝或阿里云页面上时，qoder 域里的那点
+// Cookie 只是访客态的，接口当然 401 —— 那不是「没权限」，是「还没登完」。
+func qoderBrowserOnApp(port int) (bool, string) {
+	pages, err := caListPages(port)
+	if err != nil {
+		return false, ""
+	}
+	for _, pg := range pages {
+		u, err := url.Parse(pg.URL)
+		if err != nil {
+			continue
+		}
+		if !strings.Contains(strings.ToLower(u.Host), "qoder") {
+			continue
+		}
+		p := strings.ToLower(u.Path)
+		if strings.Contains(p, "login") || strings.Contains(p, "signin") || strings.Contains(p, "sso") {
+			continue
+		}
+		return true, pg.URL
+	}
+	return false, ""
+}
+
+// qoderRawCookieHeader 把 qoder 域下的 Cookie 直接拼成 Cookie 头。
+//
+// 按标准，host-only Cookie 只发给设置它的那个主机；但网页自己的 JS 请求
+// openapi 子域时浏览器是按站点规则带上它们的。Go 的 cookiejar 严格实现标准，
+// 遇到 host-only 会话就会漏带，于是「浏览器里明明登录了，接口却 401」。
+// 这里不做任何过滤，凡是域与目标主机同一站点的全带上，作为 401 的兜底。
+func qoderRawCookieHeader(all []cdpCookie, target string) string {
+	tu, err := url.Parse(target)
+	if err != nil {
+		return ""
+	}
+	host := strings.ToLower(tu.Host)
+	var parts []string
+	seen := map[string]bool{}
+	for _, c := range all {
+		if c.Name == "" || c.Value == "" {
+			continue
+		}
+		d := strings.TrimPrefix(strings.ToLower(c.Domain), ".")
+		if d == "" || !strings.Contains(d, "qoder") {
+			continue
+		}
+		if host != d && !strings.HasSuffix(host, "."+d) {
+			continue
+		}
+		if seen[c.Name] {
+			continue
+		}
+		seen[c.Name] = true
+		parts = append(parts, c.Name+"="+c.Value)
+	}
+	return strings.Join(parts, "; ")
+}
+
+// qoderWebGetRaw 用显式 Cookie 头发一次 GET（不走 cookiejar）。
+func qoderWebGetRaw(base, cookieHeader, path string) (int, []byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Cookie", cookieHeader)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	return resp.StatusCode, raw, nil
 }
 
 // saveQoderWebCookies 把网页会话 Cookie 落到该账号的 profile 目录（0600）。

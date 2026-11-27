@@ -377,6 +377,8 @@ func doubaoRunInBrowser(cookies map[string]string, doClick bool, baseDir string)
 		doubaoPortMu.Unlock()
 		return "error", "启动无头浏览器失败: " + err.Error(), ""
 	}
+	// 端口复用：新窗口要重新点一次登录入口。
+	browserQRForget(port, "doubao")
 	for i := 0; i < 25; i++ {
 		if c, derr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond); derr == nil {
 			_ = c.Close()

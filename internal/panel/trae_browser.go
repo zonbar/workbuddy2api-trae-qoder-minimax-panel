@@ -275,6 +275,8 @@ func (p *Panel) traeBrowserStart(w http.ResponseWriter, r *http.Request) {
 	traeBrowserSession.done = false
 	traeBrowserSession.ok = false
 	traeBrowserSession.message = ""
+	// 端口复用：新窗口要重新点一次登录入口，别继承上一次的「已准备」标记。
+	browserQRForget(port, "trae")
 	log.Printf("panel: 已拉起浏览器取 Trae 凭证（调试端口 %d，profile %s）", port, dir)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "已打开浏览器，请登录 Trae 账号（新窗口是干净会话，可登录任意账号）"})
 }
