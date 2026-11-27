@@ -1516,9 +1516,11 @@ function resetBrowserQr() {
   if (img) { img.hidden = true; img.removeAttribute('src'); }
   if (st) st.textContent = '正在打开登录页…';
 }
-function browserQrStatus(text) {
+function browserQrStatus(text, isErr) {
   const st = $('browserQrState');
-  if (st) st.textContent = text || '';
+  if (!st) return;
+  st.textContent = text || '';
+  st.classList.toggle('err', !!isErr);
 }
 async function refreshBrowserQrShot() {
   // 后端要逐个候选框截图校验，单次请求可能比轮询间隔长；这里串行化，
@@ -1559,12 +1561,18 @@ async function pollBrowserQrShot() {
     const r = await api(flow.poll + suffix);
     if (r.done) {
       stopBrowserQrPoll();
-      browserQrStatus(r.message || (r.ok ? '登录成功' : '登录未完成'));
+      const okAll = r.ok !== false;
+      browserQrStatus(r.message || (okAll ? '登录成功' : '登录未完成'), !okAll);
+      if (!okAll) {
+        // 失败时把二维码撤掉，否则残留的图会让人以为「还在等扫码」。
+        const im = $('browserQrImg');
+        if (im) { im.hidden = true; im.removeAttribute('src'); }
+      }
       loadOverview(true);
       if (typeof reloadCurrentView === 'function') reloadCurrentView(true);
       return;
     }
-    if (r.expired || r.fatal) { stopBrowserQrPoll(); browserQrStatus(r.message || '登录已结束'); return; }
+    if (r.expired || r.fatal) { stopBrowserQrPoll(); browserQrStatus(r.message || '登录已结束', true); return; }
     if (r.message) browserQrStatus(r.message);
   } catch (e) {
     // 浏览器刚启动、CDP 还没就绪时会短暂报错，下一轮继续。
@@ -1584,8 +1592,11 @@ async function startBrowserQr(platform, email) {
     const body = Object.assign({ email: browserQrEmail }, flow.body || {});
     await api(flow.start, { method: 'POST', body: JSON.stringify(body) });
   } catch (e) {
-    browserQrStatus('启动登录浏览器失败：' + e.message);
+    // 注意顺序：resetBrowserQr 会把整个二维码区隐藏，所以失败提示必须在它之后
+    // 重新显示出来 —— 早先先提示后 reset，用户看到的就是「点了没反应」。
     resetBrowserQr();
+    if (box) box.hidden = false;
+    browserQrStatus('启动登录浏览器失败：' + e.message, true);
     return;
   }
   await refreshBrowserQrShot();
@@ -1593,8 +1604,11 @@ async function startBrowserQr(platform, email) {
 }
 function startQoderQr() {
   const cur = $('addQoderCur') ? ($('addQoderCur').getAttribute('data-email') || '') : '';
-  const email = prompt('给哪个 Qoder 账号建立扫码登录会话？\n填邮箱（面板会为它建一个独立的无头浏览器会话）：', cur || '');
-  if (email && email.trim()) startBrowserQr('qoder', email.trim());
+  // 支付宝扫码走的是阿里云 SSO，本来就不需要先知道邮箱 —— 直接确定即可。
+  // 只有在同一台机器上要区分多个 Qoder 号时才需要填（用于隔离浏览器 profile）。
+  const email = prompt('Qoder 扫码登录（支付宝）\n\n直接点「确定」即可开始扫码；\n如果要给指定账号单独建会话，可以填邮箱：', cur || '');
+  if (email === null) return;
+  startBrowserQr('qoder', (email || '').trim());
 }
 if ($('btnQoderQr')) $('btnQoderQr').onclick = startQoderQr;
 if ($('btnTraeQr')) $('btnTraeQr').onclick = () => startBrowserQr('trae');

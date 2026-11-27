@@ -168,9 +168,10 @@ func (p *Panel) browserQRPort(platform, email string) (int, error) {
 			return codeartsBrowserSession.port, nil
 		}
 	case "qoder":
+		// 支付宝扫码不带邮箱时用固定会话键（与 qoderWebStart 一致）。
 		email = strings.TrimSpace(email)
 		if email == "" {
-			return 0, fmt.Errorf("missing email")
+			email = qoderSSOSessionKey
 		}
 		qoderWebSessions.mu.Lock()
 		defer qoderWebSessions.mu.Unlock()

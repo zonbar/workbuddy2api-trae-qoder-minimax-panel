@@ -31,6 +31,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -173,16 +174,36 @@ func writeTraeAccounts(fp string, f TraeAccountsFile) error {
 	return os.Rename(tmp, fp)
 }
 
-// traeDataDir 解析 Trae 数据目录：显式配置优先，否则用 %APPDATA%\TraeWorkAssistant。
+// traeDataDir 解析 Trae 数据目录。优先级：
+//
+//  1. 显式配置的 trae.data_dir；
+//  2. 环境变量 TRAE_DATA_DIR（容器部署最省事，不必改配置文件）；
+//  3. Windows：%APPDATA%\TraeWorkAssistant（Trae 助手桌面端默认目录）；
+//  4. macOS：~/Library/Application Support/TraeWorkAssistant（同 Windows 的等价位置）；
+//  5. 其它平台：$XDG_DATA_HOME/TraeWorkAssistant，否则 $HOME/.local/share/TraeWorkAssistant。
+//
+// 第 3 步之外的回落是必须的：容器（Alpine/Debian）里根本没有 APPDATA，早先只认
+// %APPDATA% 会让「扫码登录成功但保存失败」「令牌续期读不到账号」成片出现。
 func traeDataDir(configured string) (string, error) {
 	if d := strings.TrimSpace(configured); d != "" {
 		return d, nil
 	}
-	appData := os.Getenv("APPDATA")
-	if appData == "" {
-		return "", fmt.Errorf("未配置 trae.data_dir 且无法读取 APPDATA 环境变量")
+	if d := strings.TrimSpace(os.Getenv("TRAE_DATA_DIR")); d != "" {
+		return d, nil
 	}
-	return filepath.Join(appData, "TraeWorkAssistant"), nil
+	if appData := os.Getenv("APPDATA"); appData != "" {
+		return filepath.Join(appData, "TraeWorkAssistant"), nil
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if runtime.GOOS == "darwin" {
+			return filepath.Join(home, "Library", "Application Support", "TraeWorkAssistant"), nil
+		}
+		if xdg := strings.TrimSpace(os.Getenv("XDG_DATA_HOME")); xdg != "" {
+			return filepath.Join(xdg, "TraeWorkAssistant"), nil
+		}
+		return filepath.Join(home, ".local", "share", "TraeWorkAssistant"), nil
+	}
+	return "", fmt.Errorf("未配置 trae.data_dir（可设环境变量 TRAE_DATA_DIR），且无法推导数据目录")
 }
 
 // traeUserIDFromJWT 从 JWT payload 取 user id（不校验签名，与脚本同口径）。

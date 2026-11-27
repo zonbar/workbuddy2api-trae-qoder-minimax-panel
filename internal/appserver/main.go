@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -155,6 +156,15 @@ func Run() {
 		if err != nil {
 			log.Fatalf("load config: %v", err)
 		}
+	}
+
+	// Trae 数据目录：容器 / NAS 部署既没有 %APPDATA% 也没有持久的 $HOME，未显式配置时
+	// 落到 state 文件同目录的 trae/ —— 跟其它数据一起挂在持久卷上，重启不丢账号，
+	// 用户也不必先去配置页填一个绝对路径。
+	// macOS / Windows 桌面端保持原回落（Trae 助手真实数据目录），免得读不到已有账号。
+	if strings.TrimSpace(cfg.Trae.DataDir) == "" && runtime.GOOS == "linux" {
+		cfg.Trae.DataDir = stateSibling(cfg.StateFile, "trae")
+		log.Printf("panel: trae.data_dir 未配置，改用 %s（与 state 文件同目录）", cfg.Trae.DataDir)
 	}
 
 	// MiniMax Code 通道（minimax: 前缀）：登录态来自客户端 ~/.minimax/auth，

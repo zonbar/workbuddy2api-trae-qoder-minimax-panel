@@ -75,6 +75,24 @@ func qoderSSOAlipayURL() string {
 
 const qoderWebTTL = 30 * time.Minute
 
+// qoderSSOSessionKey 未填邮箱时的会话键。
+//
+// 支付宝扫码走阿里云 SSO，扫码前根本不知道会登进哪个号，强制先填邮箱等于
+// 让用户在「我还没登录」的时候回答「你登录的是谁」—— 多余的卡点。未填时
+// 统一用这个键：一次只跑一个 SSO 会话，profile 目录也随之固定。
+const qoderSSOSessionKey = "sso"
+
+// qoderWebKey 会话键：优先显式邮箱，SSO 场景缺省回落固定键。
+func qoderWebKey(email string, sso bool) string {
+	if e := strings.TrimSpace(email); e != "" {
+		return e
+	}
+	if sso {
+		return qoderSSOSessionKey
+	}
+	return ""
+}
+
 // qoderWebSession 一次「网页登录 + 领取」的进行态（按账号分别记）。
 var qoderWebSessions = struct {
 	mu sync.Mutex
@@ -127,7 +145,7 @@ func (p *Panel) qoderWebStart(w http.ResponseWriter, r *http.Request) {
 		SSO   bool   `json:"sso"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	email := strings.TrimSpace(req.Email)
+	email := qoderWebKey(req.Email, req.SSO)
 	if email == "" {
 		writeErr(w, http.StatusBadRequest, "email_required")
 		return
@@ -193,11 +211,15 @@ func (p *Panel) qoderWebStart(w http.ResponseWriter, r *http.Request) {
 // qoderWebPoll 轮询网页登录态；登录好了就把今天的每日额度领掉并存进号池。
 func (p *Panel) qoderWebPoll(w http.ResponseWriter, r *http.Request) {
 	email := strings.TrimSpace(r.URL.Query().Get("email"))
+	if email == "" {
+		// 没带邮箱：SSO 扫码会话就是这个固定键，前端不必知道它。
+		email = qoderSSOSessionKey
+	}
 	qoderWebSessions.mu.Lock()
 	st := qoderWebSessions.by[email]
 	qoderWebSessions.mu.Unlock()
 	if st == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": "还没开始，请点「网页登录并添加」"})
+		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": "还没开始，请点「扫码登录（支付宝）」"})
 		return
 	}
 	qoderWebSessions.mu.Lock()
