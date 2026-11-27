@@ -1646,15 +1646,67 @@ async function startBrowserQr(platform, email) {
     if (tick % every === 0) pollBrowserQrShot();
   }, 2500);
 }
+/* ── Qoder 邮箱就地填写 ────────────────────────────────────────────────
+   以前用 window.prompt 弹窗问邮箱：容器/远程访问时会被浏览器拦掉（返回 null），
+   点按钮就是「没反应」；弹窗还会盖住二维码区域、手机上尤其难填。
+   现在改成面板里的输入框：留空 = 默认会话（扫码登录按实际扫的号识别），
+   填了 = 为该账号单独建一份浏览器 profile，多个号互不干扰。 */
+function qoderEmailEl() { return $('addQoderEmail'); }
+function qoderEmailValue() {
+  const el = qoderEmailEl();
+  return el ? String(el.value || '').trim() : '';
+}
+function qoderEmailNote(msg, isErr) {
+  const el = qoderEmailEl();
+  if (el) el.classList.toggle('invalid', !!isErr);
+  const err = $('addQoderErr');
+  if (err) {
+    err.hidden = !isErr;
+    err.textContent = isErr ? (msg || '') : '';
+  }
+}
+// required=true 时必须填：网页登录要按号建独立会话，不知道是哪个号就无从落库。
+function readQoderEmail(required) {
+  const v = qoderEmailValue();
+  if (!v) {
+    if (!required) { qoderEmailNote('', false); return ''; }
+    qoderEmailNote('请先在上面填写要添加的 Qoder 账号邮箱（例如 you@example.com）', true);
+    const el = qoderEmailEl();
+    if (el) el.focus();
+    return null;
+  }
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(v)) {
+    qoderEmailNote('邮箱格式不对：' + v + '，要形如 you@example.com', true);
+    const el = qoderEmailEl();
+    if (el) el.focus();
+    return null;
+  }
+  qoderEmailNote('', false);
+  return v;
+}
 function startQoderQr() {
-  const cur = $('addQoderCur') ? ($('addQoderCur').getAttribute('data-email') || '') : '';
-  // 支付宝扫码走的是阿里云 SSO，本来就不需要先知道邮箱 —— 直接确定即可。
-  // 只有在同一台机器上要区分多个 Qoder 号时才需要填（用于隔离浏览器 profile）。
-  const email = prompt('Qoder 扫码登录（支付宝）\n\n直接点「确定」即可开始扫码；\n如果要给指定账号单独建会话，可以填邮箱：', cur || '');
+  // 支付宝扫码走的是阿里云 SSO，本来就不需要先知道邮箱 —— 输入框留空即可开始。
+  const email = readQoderEmail(false);
   if (email === null) return;
-  startBrowserQr('qoder', (email || '').trim());
+  startBrowserQr('qoder', email);
 }
 if ($('btnQoderQr')) $('btnQoderQr').onclick = startQoderQr;
+if ($('addQoderEmail')) {
+  $('addQoderEmail').addEventListener('keydown', ev => {
+    if (ev.key === 'Enter') { ev.preventDefault(); startQoderQr(); }
+  });
+  $('addQoderEmail').addEventListener('input', () => qoderEmailNote('', false));
+}
+if ($('btnQoderEmailCur')) {
+  $('btnQoderEmailCur').onclick = () => {
+    const cur = $('addQoderCur') ? ($('addQoderCur').getAttribute('data-email') || '') : '';
+    const el = qoderEmailEl();
+    if (!el) return;
+    el.value = cur;
+    qoderEmailNote('', false);
+    el.focus();
+  };
+}
 if ($('btnTraeQr')) $('btnTraeQr').onclick = () => startBrowserQr('trae');
 if ($('btnDbQr')) $('btnDbQr').onclick = () => startBrowserQr('doubao');
 if ($('btnCaQr')) $('btnCaQr').onclick = () => startBrowserQr('codearts');
@@ -1851,11 +1903,10 @@ async function doQoderWebLogin(email) {
   } finally { b.disabled = false; b.textContent = '网页登录并添加'; }
 }
 if ($('btnQoderWeb')) $('btnQoderWeb').onclick = () => {
-  // 网页登录按号走：先问用户要给哪个号建会话（号池里选，或手填）。
-  const cur = $('addQoderCur') ? ($('addQoderCur').getAttribute('data-email') || '') : '';
-  const email = prompt('给哪个 Qoder 账号建立网页登录会话？\n填邮箱（面板会为它建一个独立的浏览器会话，登录一次即可）：', cur || '');
+  // 网页登录按号走：邮箱在面板里就地填，不再弹窗。
+  const email = readQoderEmail(true);
   if (!email) return;
-  doQoderWebLogin(email.trim());
+  doQoderWebLogin(email);
 };
 
 async function doQoderLogin() {
@@ -1902,6 +1953,7 @@ async function doQoderLogin() {
 }
 async function loadQoderAddTab() {
   resetQoderPanel();
+  qoderEmailNote('', false);   // 重新打开面板时清掉上一次的红框
   const cur = $('addQoderCur');
   if (!cur) return;
   cur.className = 'state';
@@ -1912,6 +1964,17 @@ async function loadQoderAddTab() {
     cur.textContent = d.current_email
       ? '本机当前登录：' + (d.current_name || '') + ' <' + d.current_email + '>'
       : '本机 Qoder 未登录 —— 请先登录 Qoder，再回来点「添加当前 Qoder 账号」。';
+    // 当前登录邮箱记在 data-email 上：「用当前登录」按钮与网页登录默认值都读它。
+    if (d.current_email) cur.setAttribute('data-email', d.current_email);
+    else cur.removeAttribute('data-email');
+    const em = qoderEmailEl();
+    if (em) {
+      em.placeholder = d.current_email
+        ? '要添加的账号邮箱（扫码登录可留空 = 默认会话）'
+        : '要添加的账号邮箱（扫码登录可留空）';
+    }
+    const useCur = $('btnQoderEmailCur');
+    if (useCur) useCur.hidden = !d.current_email;
     // 网页会话账号（扫码登录产出）单独列一行：它们不进 IDE 号池，
     // 但会话已保存、每日自动签到会用它们 —— 不显示出来，用户会以为「没添加成功」。
     const wl = $('addQoderWebList');

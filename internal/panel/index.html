@@ -1908,6 +1908,16 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div id="addQoderErr" class="state err" hidden></div>
         <!-- 扫码登录（支付宝）产出的网页会话账号：不进 IDE 号池，但会话有效、能每日签到 -->
         <div id="addQoderWebList" class="state" hidden style="margin-top:6px"></div>
+        <!-- 邮箱就地填写：每个号一份独立浏览器 profile，扫码登录可留空 -->
+        <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <input id="addQoderEmail" type="text" inputmode="email" autocomplete="off" spellcheck="false"
+                 placeholder="要添加的账号邮箱（扫码登录可留空）" style="flex:1 1 200px;width:auto;min-width:160px"
+                 aria-label="Qoder 账号邮箱">
+          <button id="btnQoderEmailCur" class="xs ghost" hidden type="button">用当前登录</button>
+        </div>
+        <div class="hint" style="margin-top:6px">
+          填了邮箱就为该账号单独建一份浏览器会话（多个号互不干扰）；留空则用默认会话，按实际扫码的账号识别。
+        </div>
         <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
           <button id="btnQoderQr" class="primary">扫码登录（支付宝）</button>
           <button id="btnQoderWeb" data-local-only>网页登录并添加</button>
