@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -162,7 +163,7 @@ func (p *Panel) qoderWebStart(w http.ResponseWriter, r *http.Request) {
 		// 因为上一次的浏览器已经跳到登录后的页面（二维码没了）或者进程已退出，
 		// 这时必须重新拉一次回到扫码页 —— 否则前端会一直「等待渲染二维码」，
 		// 表现就是「第一次能扫，第二次拿不到图」。
-		if time.Since(st.startedAt) < 90*time.Second && qoderWebProcAlive(st.proc) {
+		if time.Since(st.startedAt) < 90*time.Second && qoderWebProcAlive(st.proc) && qoderWebPortAlive(st.port) {
 			qoderWebSessions.mu.Unlock()
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "running": true, "message": "浏览器已在运行，请用支付宝扫码登录"})
 			return
@@ -434,6 +435,22 @@ func qoderWebProcAlive(cmd *exec.Cmd) bool {
 		return false
 	}
 	return cmd.Process.Signal(syscall.Signal(0)) == nil
+}
+
+// qoderWebPortAlive 判断调试端口是否真的在监听。
+//
+// 只看进程是不够的：浏览器崩溃后没人 Wait，进程会变成僵尸，Signal(0) 依然
+// 返回成功；而端口早已不监听 —— 于是「点扫码 → 说已在运行 → 截图 502」。
+func qoderWebPortAlive(port int) bool {
+	if port <= 0 {
+		return false
+	}
+	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 300*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = c.Close()
+	return true
 }
 
 // qoderAutoConfirmJS 扫码后自动走完阿里云的授权确认。

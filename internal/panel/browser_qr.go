@@ -207,7 +207,7 @@ func (p *Panel) browserQRPort(platform, email string) (int, error) {
 		if st := qoderWebSessions.by[email]; st != nil && st.port > 0 && st.proc != nil && !st.done {
 			// 进程已被回收时端口一定不会再监听，直接报「需要重新发起」，
 			// 比让前端一直等「二维码尚未渲染」有用得多。
-			if qoderWebProcAlive(st.proc) {
+			if qoderWebProcAlive(st.proc) && qoderWebPortAlive(st.port) {
 				return st.port, nil
 			}
 			return 0, fmt.Errorf("登录浏览器已退出，请重新点「扫码登录（支付宝）」")
