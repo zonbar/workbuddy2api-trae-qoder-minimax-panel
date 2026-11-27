@@ -862,12 +862,17 @@ func pickQoderIdentity(m map[string]any) (email, name, uid string) {
 					case "name", "nickname", "displayname", "username":
 						// 站点 /api/v1/me 的 name 有时就是邮箱（实测 zonbar@163.com），
 						// email 字段反而是空的 —— 这种当邮箱收，别当昵称丢掉。
+						// username 常常是内部 uuid（124b05dc-...），当昵称会很难看。
 						if s == "" {
 							continue
 						}
 						if strings.Contains(s, "@") {
 							if email == "" {
 								email = s
+							}
+						} else if lk == "username" {
+							if name == "" && !looksLikeUUID(s) {
+								name = s
 							}
 						} else if name == "" {
 							name = s
@@ -889,6 +894,26 @@ func pickQoderIdentity(m map[string]any) (email, name, uid string) {
 	}
 	walk(m)
 	return
+}
+
+// looksLikeUUID 判断一个字符串是不是 uuid（内部 id 不适合当昵称展示）。
+func looksLikeUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, r := range s {
+		switch i {
+		case 8, 13, 18, 23:
+			if r != '-' {
+				return false
+			}
+		default:
+			if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // qoderWebIdentityJS 在页面里找账号身份：先看常见全局对象，再扫 Web Storage。

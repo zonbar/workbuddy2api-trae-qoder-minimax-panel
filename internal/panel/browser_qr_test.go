@@ -76,6 +76,32 @@ func TestQoderCookieNamesForDiagnostics(t *testing.T) {
 	}
 }
 
+// TestPickQoderIdentityFromSiteMe 用站点 /api/v1/me 的真实返回锁住身份解析。
+func TestPickQoderIdentityFromSiteMe(t *testing.T) {
+	m := map[string]any{
+		"id":       "01a213a0-e55a-7407-a01a-e4929ab38c67",
+		"username": "124b05dc-57cd-4242-9327-2e567ef222ce",
+		"name":     "zonbar@163.com",
+		"email":    "",
+	}
+	// map 遍历顺序随机：多跑几轮，避免某一次字段顺序碰巧对。
+	for i := 0; i < 20; i++ {
+		email, name, uid := pickQoderIdentity(m)
+		if email != "zonbar@163.com" {
+			t.Fatalf("email = %q, want zonbar@163.com（name 是邮箱时要按邮箱收）", email)
+		}
+		if name != "" && looksLikeUUID(name) {
+			t.Fatalf("name = %q，内部 uuid 不能当昵称", name)
+		}
+		if uid != "01a213a0-e55a-7407-a01a-e4929ab38c67" {
+			t.Fatalf("uid = %q", uid)
+		}
+	}
+	if looksLikeUUID("zone@example.com") || !looksLikeUUID("124b05dc-57cd-4242-9327-2e567ef222ce") {
+		t.Fatal("looksLikeUUID 判错")
+	}
+}
+
 func TestBrowserQRPrepareJSHandlesAliyunSSO(t *testing.T) {
 	if !strings.Contains(browserQRPrepareJS, "account.aliyun.com/sso/login.htm") {
 		t.Fatal("prepare JS should handle Alibaba Cloud SSO page")
